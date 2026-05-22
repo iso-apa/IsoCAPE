@@ -26,18 +26,6 @@ cell_2      62
 cell_3      38
 ```
 
-IsoCAPE resolves termination positions, compares them against the GTF, and identifies unannotated polyadenylation sites:
-
-```
-RNA-seq reads → Cell Ranger / STAR → gene counts (cryptic site lost)
-
-Cell        AR
---------------------
-cell_1      45
-cell_2      62
-cell_3      38
-```
-
 IsoCAPE detects reads terminating inside AR intron 3, verifies the upstream PAS signal, and reports the cryptic site:
 
 ```
