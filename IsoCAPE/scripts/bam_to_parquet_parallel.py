@@ -96,7 +96,21 @@ def load_barcodes(barcodes_path, barcode_col=None, sep=None):
 # ---------------------------------------------------------------------------
 
 def check_internal_priming(fasta, chrom, ref_end, strand, window, threshold):
+    """
+    Check downstream sequence for A-tract (internal priming signal).
+
+    Returns:
+        'VALID_PAS'      — ref exists, no A-tract downstream
+        'INTERNAL_PRIME' — ref exists, A-tract found → likely internal priming
+        'NO_REF'         — chrom not in reference FASTA → cannot verify
+                           (use partial reference during testing;
+                            re-run with full hg38 for production)
+    """
     try:
+        # Check chrom exists in reference before fetching
+        if chrom not in fasta.references:
+            return 'NO_REF'
+
         chrom_len = fasta.get_reference_length(chrom)
         if strand == '+':
             fetch_start = ref_end
@@ -118,7 +132,7 @@ def check_internal_priming(fasta, chrom, ref_end, strand, window, threshold):
 
         return 'INTERNAL_PRIME' if max_run >= threshold else 'VALID_PAS'
     except Exception:
-        return 'VALID_PAS'
+        return 'NO_REF'
 
 
 # ---------------------------------------------------------------------------
@@ -344,10 +358,18 @@ def main():
     print(f"  Unique genes (GN): {pf['gn'].n_unique():,}")
     valid  = (pf['priming_label'] == 'VALID_PAS').sum().as_py()
     prime  = (pf['priming_label'] == 'INTERNAL_PRIME').sum().as_py()
+    no_ref = (pf['priming_label'] == 'NO_REF').sum().as_py()
     unk    = (pf['gn'] == 'UNK_GENE').sum().as_py()
     print(f"  VALID_PAS:         {valid:,}")
     print(f"  INTERNAL_PRIME:    {prime:,}")
+    print(f"  NO_REF:            {no_ref:,}  (chrom not in ref — re-run with full hg38)")
     print(f"  UNK_GENE reads:    {unk:,}")
+    if no_ref > 0:
+        print(f"\n  [NOTE] {no_ref/total:.1%} of reads have NO_REF priming label.")
+        print(f"         Internal priming could not be verified for these reads.")
+        print(f"         For production use, provide a complete hg38 reference.")
+        print(f"         site_annotator.py treats NO_REF reads as unverified —")
+        print(f"         use --include-no-ref flag to include them in analysis.")
 
 
 if __name__ == "__main__":

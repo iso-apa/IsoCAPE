@@ -219,13 +219,17 @@ def parse_args():
                         help="bp tolerance for known 3' end match "
                              "(default: 10, matches IsoDecipher tolerance)")
     parser.add_argument("--batch-size", type=int, default=500_000)
+    parser.add_argument("--include-no-ref", action="store_true",
+                        help="Include NO_REF reads (chrom not in reference FASTA). "
+                             "Default: only VALID_PAS reads. "
+                             "Use during testing with partial reference.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    print("[IsoCAPE] Building GTF index ...")
+    print(f"[IsoCAPE] Building GTF index ...")
     gtf_parser = GTFParser(gtf_path=args.gtf, db_path=args.db)
     gtf_parser.build()
 
@@ -233,6 +237,14 @@ def main():
     registry = SiteRegistry()
     pf       = pq.ParquetFile(args.parquet)
     writer   = None
+
+    # Determine which priming labels to include
+    if args.include_no_ref:
+        valid_labels = {'VALID_PAS', 'NO_REF'}
+        print(f"[IsoCAPE] Including NO_REF reads (testing mode with partial reference)")
+    else:
+        valid_labels = {'VALID_PAS'}
+        print(f"[IsoCAPE] VALID_PAS only (use --include-no-ref for partial reference)")
 
     total_reads = 0
     total_valid = 0
@@ -249,7 +261,7 @@ def main():
         batch_num   += 1
         total_reads += len(df)
 
-        df = df[df['priming_label'] == 'VALID_PAS'].copy()
+        df = df[df['priming_label'].isin(valid_labels)].copy()
         total_valid += len(df)
 
         if df.empty:
