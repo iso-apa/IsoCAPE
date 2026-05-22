@@ -97,31 +97,46 @@ CE3 is not in the standard GTF. Cell Ranger assigns these reads to AR total coun
 RNA-seq BAM (bulk / scRNA-seq / spatial)
               │
               ▼
-       IsoCAPE Scanner
-       ├── CB + UB tag filter (single-cell) or read-level (bulk)
+       bam_to_parquet.py
+       ├── CB + UB tag filter (single-cell)
+       ├── Valid barcode filter (auto-detects TSV/CSV/gz format)
        ├── UMI deduplication
        ├── Phred QC on 3' window
        └── Internal priming exclusion
-           (A-tract scan of downstream genomic sequence via hg38)
+           (A-tract scan of downstream genomic sequence)
+              │
+              ▼  reads.parquet
               │
               ▼
-       Site Annotation
-       ├── GTF comparison (±20bp)
-       │   ├── Matches annotated 3' end → IsoDecipher G-group (passthrough)
-       │   └── Intronic / unannotated  → positional clustering
-       │                                  ├── PAS signal check (AATAAA + 12 variants)
-       │                                  ├── Minimum cell / UMI confidence filter
-       │                                  └── Named: GENE_CE1, GENE_novel_1, ...
+       site_annotator.py
+       ├── Skip: UNK_GENE (no gene context)
+       ├── Skip: known 3' end ±10bp (IsoDecipher's territory)
+       ├── Skip: no PAS signal (noise)
+       ├── Intronic + PAS → CE site (GENE_CE1, GENE_CE2 ...)
+       │   e.g. AR intron 3 → AR_CE3 (AR-V7)
+       └── Genic + PAS    → PA site (GENE_PA1, GENE_PA2 ...)
+               shorter UTR / longer UTR / alternative last exon
+              │
+              ▼  cryptic_sites.parquet
               │
               ▼
-       Label Lookup (cape_labels.csv)
-       ├── AR_CE3      → "AR-V7; enzalutamide/abiraterone resistance (CRPC)"
-       ├── AR_CE1      → "AR-V1; unknown clinical significance"
-       └── GENE_novel  → "unknown"
+       build_matrix.py
+       ├── cells × sites count matrix
+       └── AnnData (.h5ad)
               │
               ▼
-       Count Matrix (cells × sites)  +  AnnData (.h5ad)
+       Downstream (scanpy)
+       ├── sc.pp.filter_genes(adata, min_cells=3)
+       ├── Label lookup (cape_labels.csv)
+       └── Integration with IsoDecipher output
 ```
+
+**Why ±10bp window matches IsoDecipher:**
+IsoCAPE uses a 10bp window to identify known 3' ends — identical to IsoDecipher's clustering tolerance. This ensures zero overlap: any site IsoDecipher would assign to a G-group is skipped by IsoCAPE, and vice versa.
+
+**CE vs PA:**
+- `CE` (Cryptic Exon): read terminates inside an annotated intron with PAS signal. The canonical case for premature polyadenylation — AR-V7's CE3 is detected here.
+- `PA` (Alternative Polyadenylation): read terminates within a known gene but at an unannotated position — shorter or longer than the GTF-recorded 3' end, or in a non-last exon. All are genuine APA events invisible to IsoDecipher.
 
 ---
 
@@ -137,42 +152,66 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### Step 1: Scan BAM for cryptic termination sites
+### Step 1: Extract reads from BAM
 
 ```bash
-python isocape/scripts/scan_bam.py \
-    --bam data/patient_01.bam \
-    --ref data/hg38.fasta \
-    --gtf data/Homo_sapiens.GRCh38.115.gtf \
-    --out results/patient_01_sites.parquet \
+python isocape/scripts/bam_to_parquet.py \
+    --bam    data/patient_01.bam \
+    --ref    data/melanoma_ref.fa \
+    --out    results/patient_01_reads.parquet \
+    --barcodes data/filtered_barcodes.csv \
+    [--cores 4] \
+    [--window 80] \
     [--min-phred 20] \
-    [--min-cells 10] \
     [--priming-threshold 8]
 ```
 
-Output columns: `cb`, `ub`, `chrom`, `ref_end`, `strand`, `site_id`, `site_type`, `pas_signal`, `priming_label`
+Output columns: `cb`, `ub`, `gn`, `chrom`, `ref_end`, `strand`, `priming_label`
 
-### Step 2: Build count matrix
+### Step 2: Annotate cryptic sites
+
+```bash
+python isocape/scripts/annotator/site_annotator.py \
+    --parquet results/patient_01_reads.parquet \
+    --gtf     data/Homo_sapiens.GRCh38.115.gtf \
+    --db      data/Homo_sapiens.GRCh38.115.gtf.db \
+    --ref     data/melanoma_ref.fa \
+    --out     results/patient_01_cryptic.parquet \
+    [--window 10]
+```
+
+Output columns: `cb`, `ub`, `gn`, `chrom`, `ref_end`, `strand`, `site_id`, `site_type`, `pas_signal`, `gene`
+
+### Step 3: Build count matrix
 
 ```bash
 python isocape/scripts/build_matrix.py \
-    --sites results/patient_01_sites.parquet \
+    --sites  results/patient_01_cryptic.parquet \
     --labels isocape/cape_labels.csv \
-    --out results/patient_01_cape.h5ad
+    --out    results/patient_01_cape.h5ad
 ```
 
-### Step 3: Downstream analysis (Python)
+### Step 4: Downstream analysis (Python)
 
 ```python
 import scanpy as sc
+import anndata as ad
 
-adata = sc.read_h5ad("results/patient_01_cape.h5ad")
+# IsoCAPE output
+cape = sc.read_h5ad("results/patient_01_cape.h5ad")
 
-# Filter to high-confidence novel sites
-adata = adata[:, adata.var['site_type'] == 'novel']
+# Filter low-confidence sites (same as scanpy standard)
+sc.pp.filter_genes(cape, min_cells=3)
+
+# CE sites only (intronic premature polyadenylation)
+ce = cape[:, cape.var['site_type'] == 'CE']
 
 # Check AR-V7 status per cell
-ar_v7 = adata[:, adata.var['label'].str.contains('AR-V7', na=False)]
+ar_v7 = ce[:, ce.var_names.str.startswith('AR_CE')]
+
+# Combine with IsoDecipher output
+apa = sc.read_h5ad("isodecipher_output.h5ad")
+combined = ad.concat([apa, cape], axis=1)
 ```
 
 ---
@@ -181,12 +220,12 @@ ar_v7 = adata[:, adata.var['label'].str.contains('AR-V7', na=False)]
 
 | Site type | Example ID | Meaning |
 |-----------|-----------|---------|
-| Annotated (GTF match) | `AR_G0` | Known 3'UTR end, IsoDecipher-compatible |
-| Cryptic exon (labeled) | `AR_CE3` | Known cryptic exon with clinical label |
-| Cryptic exon (novel) | `KRAS_CE1` | Intronic pileup + PAS signal, not in GTF |
-| Novel 3'UTR extension | `CD59_novel_1` | Beyond annotated 3' end |
+| CE (Cryptic Exon) | `AR_CE3` | Intronic termination + PAS signal — premature polyadenylation |
+| PA (Alternative PA) | `BRAF_PA1` | Genic termination at unannotated position + PAS signal — shorter UTR, longer UTR, or alternative last exon |
 
-Coordinate information is stored in `adata.var` for all novel sites, enabling IGV inspection and future annotation.
+Both CE and PA sites are absent from GTF annotation. IsoDecipher handles annotated 3' ends (G-groups); IsoCAPE handles everything else within gene boundaries.
+
+Coordinate information (`chrom`, `ref_end`, `strand`) is stored in `adata.var` for all sites, enabling IGV inspection and future annotation.
 
 ---
 
@@ -209,23 +248,25 @@ The label file is a plain CSV — contributions welcome via pull request.
 
 ## Integration with IsoDecipher
 
-IsoCAPE and IsoDecipher are designed to complement each other:
+IsoCAPE and IsoDecipher have a clean division of labour:
 
-- **IsoDecipher** quantifies APA within annotated 3'UTR space (the known world)
-- **IsoCAPE** detects polyadenylation outside annotation (what the GTF misses)
+- **IsoDecipher** quantifies APA at annotated 3' ends — GTF-anchored, high-fidelity G-groups
+- **IsoCAPE** detects APA at unannotated positions — CE and PA sites the GTF misses
 
-Their outputs share the same AnnData structure and can be concatenated along the `var` axis for a complete isoform landscape:
+The ±10bp window in IsoCAPE's site annotator matches IsoDecipher's clustering tolerance exactly, ensuring **zero overlap** between their outputs. Their AnnData objects share the same structure and concatenate directly:
 
 ```python
 import anndata as ad
+import scanpy as sc
 
-gex    = sc.read_h5ad("isodecipher_output.h5ad")   # annotated APA
-cryptic = sc.read_h5ad("isocape_output.h5ad")       # cryptic sites
+apa  = sc.read_h5ad("isodecipher_output.h5ad")   # annotated APA (G-groups)
+cape = sc.read_h5ad("isocape_output.h5ad")         # cryptic sites (CE + PA)
 
-combined = ad.concat([gex, cryptic], axis=1)
+combined = ad.concat([apa, cape], axis=1)
+# combined.var['feature_types'] distinguishes the two
 ```
 
-IsoCAPE novel sites are also the source vocabulary for **IsoDecipher-GPT** — the foundation model learns from both annotated and cryptic termination events.
+IsoCAPE CE and PA sites are also candidate vocabulary entries for **IsoFormer** — the foundation model learns from both annotated and cryptic termination events across normal differentiation and malignancy.
 
 ---
 
@@ -233,17 +274,17 @@ IsoCAPE novel sites are also the source vocabulary for **IsoDecipher-GPT** — t
 
 ```
 IsoCAPE/
-├── isocape/
-│   ├── scripts/
-│   │   ├── scan_bam.py          # Step 1: BAM → cryptic site detection
-│   │   ├── annotate_sites.py    # Step 2: GTF comparison + site naming
-│   │   ├── build_matrix.py      # Step 3: cells × sites count matrix
-│   │   └── utils.py             # PAS signal detection, A-tract filter
-│   └── __init__.py
+├── IsoCAPE/
+│   └── scripts/
+│       ├── bam_to_parquet.py           # Step 1: BAM → reads parquet (parallel streaming)
+│       ├── bam_to_parquet_parallel.py  # Step 1: parallel version (multi-core)
+│       └── annotator/
+│           ├── gtf_parser.py           # GTF/DB index builder
+│           └── site_annotator.py       # Step 2: cryptic site annotation (CE + PA)
 ├── notebooks/
-│   └── 01_AR-V7_demo.ipynb      # Validation: AR-V7 detection in CRPC dataset
+│   └── 01_AR-V7_demo.ipynb            # Validation: AR-V7 detection in CRPC dataset
 ├── data/
-│   └── cape_labels.csv          # Curated clinical label layer
+│   └── cape_labels.csv                # Curated clinical label layer
 ├── results/
 │   └── figures/
 ├── requirements.txt
