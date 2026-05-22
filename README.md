@@ -26,17 +26,35 @@ cell_2      62
 cell_3      38
 ```
 
-IsoCAPE resolves termination positions, compares them against the GTF, and labels intronic pileups:
+IsoCAPE resolves termination positions, compares them against the GTF, and identifies unannotated polyadenylation sites:
 
 ```
-Cell      AR_FL (annotated)   AR_CE3 (AR-V7)
-----------------------------------------------
-cell_1          44                  1
-cell_2          18                 44
-cell_3          37                  1
+RNA-seq reads → Cell Ranger / STAR → gene counts (cryptic site lost)
+
+Cell        AR
+--------------------
+cell_1      45
+cell_2      62
+cell_3      38
 ```
 
-cell_2 is expressing AR-V7 at high level. This is invisible to standard pipelines. It is directly detectable from the existing BAM file.
+IsoCAPE detects reads terminating inside AR intron 3, verifies the upstream PAS signal, and reports the cryptic site:
+
+```
+Cell      AR_CE3 (AR-V7, cryptic intron 3 site)
+------------------------------------------------
+cell_1          1
+cell_2         44
+cell_3          1
+```
+
+cell_2 is expressing AR-V7 at high level. This is invisible to standard pipelines. Combine with IsoDecipher for the complete APA landscape:
+
+```python
+apa     = sc.read_h5ad("isodecipher_output.h5ad")  # AR_G0, AR_G1... (annotated)
+cryptic = sc.read_h5ad("isocape_output.h5ad")       # AR_CE3 (cryptic)
+combined = ad.concat([apa, cryptic], axis=1)
+```
 
 ---
 
@@ -77,15 +95,15 @@ CE3 is not in the standard GTF. Cell Ranger assigns these reads to AR total coun
 | Bulk RNA-seq | ❌ | ✅ | ✅ | ✅ |
 | Internal priming exclusion | ✅ | N/A | ❌ | ✅ |
 | Intronic / cryptic site detection | partial | ✅ | ❌ | ✅ |
-| PAS signal verification (AATAAA) | ❌ | ❌ | ❌ | ✅ |
-| GTF-hybrid naming | ❌ | ❌ | ❌ | ✅ |
+| PAS signal verification (AATAAA + variants) | ❌ | ❌ | ❌ | ✅ |
+| GTF-exclusion naming | ❌ | ❌ | ❌ | ✅ |
 | Clinical label layer | ❌ | ❌ | ❌ | ✅ |
 | Scanpy-ready output | ✅ | ❌ | ❌ | ✅ |
 | Works on archived BAMs | ❌ | ✅ | ✅ | ✅ |
 
 **Why reads 1 independence matters:** The majority of public 10x Genomics datasets have reads 1 trimmed or not sequenced. scTail, the only existing single-cell PAS detection tool, requires preserved reads 1 and cannot be applied to most archived datasets. IsoCAPE operates entirely on reads 2 — the same reads used by Cell Ranger — making it compatible with every standard 3' scRNA-seq dataset ever deposited.
 
-**Why the GTF-hybrid approach matters:** Fully de novo tools fragment reads across low-confidence peaks and produce coordinate-only feature names with no biological interpretability. Pure GTF tools miss everything outside annotation. IsoCAPE anchors known sites to GTF structure (preserving IsoDecipher compatibility) and assigns systematic, human-readable names to novel sites — `AR_CE3`, `GENE_novel_1` — that are immediately usable as ML features or clinical labels.
+**Why IsoCAPE's approach matters:** De novo tools like Sierra call any read pileup as a peak — producing coordinate-only names like `chr7:140833972` with no gene context and high noise. IsoCAPE uses the GTF as an exclusion reference to define what is already known (handled by IsoDecipher), then applies two-layer filtering — internal priming exclusion and PAS signal verification — to confirm only biologically meaningful unannotated sites. Every IsoCAPE site carries a gene name, a type (CE or PA), and a verified polyadenylation signal, making them immediately interpretable as clinical features or ML inputs without post-processing.
 
 **Why the label layer matters:** Unknown sites are not useless. They are ML features with full rights, retrospectively labelable as biology catches up, and candidates for novel discovery. The label layer is a living CSV — `cape_labels.csv` — that maps site IDs to known clinical relevance. It ships with curated entries for AR-V7 and grows as the community contributes.
 
@@ -157,7 +175,7 @@ pip install -r requirements.txt
 ```bash
 python isocape/scripts/bam_to_parquet.py \
     --bam    data/patient_01.bam \
-    --ref    data/melanoma_ref.fa \
+    --ref    data/hg38.fa \
     --out    results/patient_01_reads.parquet \
     --barcodes data/filtered_barcodes.csv \
     [--cores 4] \
@@ -175,7 +193,7 @@ python isocape/scripts/annotator/site_annotator.py \
     --parquet results/patient_01_reads.parquet \
     --gtf     data/Homo_sapiens.GRCh38.115.gtf \
     --db      data/Homo_sapiens.GRCh38.115.gtf.db \
-    --ref     data/melanoma_ref.fa \
+    --ref     data/hg38.fa \
     --out     results/patient_01_cryptic.parquet \
     [--window 10]
 ```
