@@ -36,15 +36,9 @@ cell_2         44
 cell_3          1
 ```
 
-cell_2 is expressing AR-V7 at high level. This is invisible to standard pipelines. Combine with IsoDecipher via obsm layers for the complete APA landscape:
 
-```python
-# Store as separate obsm layers 
-adata_gex.obsm['isocape']  = cape_matrix    # CE + PA + known sites
-adata_gex.obsm['isoform']  = apa_matrix     # annotated G-groups
-adata_gex.uns['isocape_features'] = cape.var_names.tolist()
-adata_gex.uns['isoform_features'] = iso_feats.tolist()
-```
+cell_2 is expressing AR-V7 at high level. This is invisible to standard pipelines. IsoCAPE and IsoDecipher outputs are stored as separate `obsm` layers in the GEX AnnData object — see [Integration with IsoDecipher](#integration-with-isodecipher) for the complete integration pattern.
+
 
 ---
 
