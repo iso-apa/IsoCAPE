@@ -36,12 +36,14 @@ cell_2         44
 cell_3          1
 ```
 
-cell_2 is expressing AR-V7 at high level. This is invisible to standard pipelines. Combine with IsoDecipher for the complete APA landscape:
+cell_2 is expressing AR-V7 at high level. This is invisible to standard pipelines. Combine with IsoDecipher via obsm layers for the complete APA landscape:
 
 ```python
-apa     = sc.read_h5ad("isodecipher_output.h5ad")  # AR_G0, AR_G1... (annotated)
-cryptic = sc.read_h5ad("isocape_output.h5ad")       # AR_CE3 (cryptic)
-combined = ad.concat([apa, cryptic], axis=1)
+# Store as separate obsm layers 
+adata_gex.obsm['isocape']  = cape_matrix    # CE + PA + known sites
+adata_gex.obsm['isoform']  = apa_matrix     # annotated G-groups
+adata_gex.uns['isocape_features'] = cape.var_names.tolist()
+adata_gex.uns['isoform_features'] = iso_feats.tolist()
 ```
 
 ---
@@ -109,40 +111,70 @@ RNA-seq BAM (bulk / scRNA-seq / spatial)
        ├── UMI deduplication
        ├── Phred QC on 3' window
        └── Internal priming exclusion
-           (A-tract scan of downstream genomic sequence)
+           (A-tract scan ≥8 consecutive A's in downstream 20bp;
+            reads failing this check are labelled INTERNAL_PRIME
+            and excluded from downstream steps)
               │
-              ▼  reads.parquet
+              ▼  reads.parquet  [priming_label = VALID_PAS | INTERNAL_PRIME | NO_REF]
               │
               ▼
        site_annotator.py
-       ├── Skip: UNK_GENE (no gene context)
-       ├── Skip: known 3' end ±10bp (IsoDecipher's territory)
-       ├── Skip: no PAS signal (noise)
-       ├── Intronic + PAS → CE site (GENE_CE1, GENE_CE2 ...)
-       │   e.g. AR intron 3 → AR_CE3 (AR-V7)
-       └── Genic + PAS    → PA site (GENE_PA1, GENE_PA2 ...)
-               shorter UTR / longer UTR / alternative last exon
+       ├── Skip: UNK_GENE (no gene context from GN tag)
+       ├── Known 3' end check: ±50bp window against protein_coding
+       │   transcript 3' ends (tx_biotype = protein_coding only;
+       │   retained_intron / NMD transcript ends excluded)
+       │   → match: labelled `known`; always output as reference signal
+       ├── PAS signal check: scan 60bp upstream of ref_end
+       │   PAS must be ≥10bp from ref_end (PAS_MIN_DIST)
+       │   → no PAS: skip (noise)
+       ├── CE classification (three independent filters required):
+       │   1. query_intron(): read falls in protein_coding intron
+       │   2. query_exon():   NOT in any exon of protein_coding /
+       │                      NMD / non_stop_decay transcript
+       │   3. GN tag == intron gene (neighboring-gene noise filter)
+       │   → all three pass: labelled `CE`  (GENE_CE_{coord})
+       └── PA classification (remaining genic + PAS reads):
+           → labelled `PA`  (GENE_PA_{coord})
               │
-              ▼  cryptic_sites.parquet
+              ▼  cryptic.parquet
               │
               ▼
        build_matrix.py
-       ├── cells × sites count matrix
-       └── AnnData (.h5ad)
+       ├── Pass 1: cluster reads per (gene, chrom, strand, site_type)
+       │   within ±10bp tolerance; CE / PA / known never merge
+       ├── Pass 2: filter clusters with < min_reads (default 3)
+       ├── Coord-based stable naming: GENE_CE_{rep_coord}
+       ├── PolyASite 2.0 validation (--polyadb):
+       │   PA within ±50bp of known polyA site → PA_validated
+       │   PA with no database match           → PA_novel
+       └── AnnData (.h5ad): cells × sites
               │
               ▼
        Downstream (scanpy)
        ├── sc.pp.filter_genes(adata, min_cells=3)
+       ├── CE fraction: CE / (CE + PA + known)  per gene
        ├── Label lookup (cape_labels.csv)
-       └── Integration with IsoDecipher output
+       └── Integration with IsoDecipher output (obsm layers)
 ```
 
-**Why ±10bp window matches IsoDecipher:**
-IsoCAPE uses a 10bp window to identify known 3' ends — identical to IsoDecipher's clustering tolerance. This ensures zero overlap: any site IsoDecipher would assign to a G-group is skipped by IsoCAPE, and vice versa.
+**GTF biotype handling:**
 
-**CE vs PA:**
-- `CE` (Cryptic Exon): read terminates inside an annotated intron with PAS signal. The canonical case for premature polyadenylation — AR-V7's CE3 is detected here.
-- `PA` (Alternative Polyadenylation): read terminates within a known gene but at an unannotated position — shorter or longer than the GTF-recorded 3' end, or in a non-last exon. All are genuine APA events invisible to IsoDecipher.
+| Index | Biotypes included | Purpose |
+|-------|------------------|---------|
+| `intron_trees` | `protein_coding` only | CE positive signal — intron must belong to protein-coding transcript |
+| `exon_trees` | `protein_coding`, `protein_coding_CDS_not_defined`, `protein_coding_LoF`, `nonsense_mediated_decay`, `non_stop_decay` | CE negative filter — excludes positions exonic in any of these transcripts |
+| `known_3p_ends` | `protein_coding` **transcript** (`tx_biotype`) | Known 3' end reference — retained_intron / NMD transcript ends excluded to prevent false known calls in intron regions |
+
+**Known sites:**
+`known` sites are always output alongside CE and PA. They represent reads terminating within ±50bp of a GTF-annotated protein-coding transcript 3' end. Use them as the denominator for CE fraction:
+
+```
+CE fraction = CE / (CE + PA + known)
+```
+
+**CE vs PA reliability:**
+
+CE sites pass three independent filters (intron membership, exon exclusion, GN tag consistency) before PAS verification. PA sites pass only genic membership and PAS verification. **CE sites are substantially more reliable than PA sites.** See [Caveats](#caveats) for details.
 
 ---
 
@@ -183,41 +215,73 @@ python isocape/scripts/annotator/site_annotator.py \
     --db      data/Homo_sapiens.GRCh38.115.gtf.db \
     --ref     data/hg38.fa \
     --out     results/patient_01_cryptic.parquet \
-    [--window 10]
+    [--known-window 50]    # bp window for known 3' end matching (default: 50)
 ```
 
 Output columns: `cb`, `ub`, `gn`, `chrom`, `ref_end`, `strand`, `site_id`, `site_type`, `pas_signal`, `gene`
+
+`site_type` values: `CE` | `PA` | `known`
 
 ### Step 3: Build count matrix
 
 ```bash
 python isocape/scripts/build_matrix.py \
-    --sites  results/patient_01_cryptic.parquet \
-    --labels isocape/cape_labels.csv \
-    --out    results/patient_01_cape.h5ad
+    --parquet  results/patient_01_cryptic.parquet \
+    --out      results/patient_01_cape.h5ad \
+    --sample   patient_01 \               # sample prefix for barcodes (e.g. IDC)
+    [--labels  isocape/cape_labels.csv] \
+    [--polyadb data/polyasite2_hg38.bed] \ # PolyASite 2.0 for PA validation
+    [--min-reads 3] \                      # minimum reads per site cluster
+    [--tolerance 10]                       # clustering window in bp
+```
+
+`--sample`: formats barcodes as `SAMPLE_BARCODE` — use the same name as IsoDecipher for direct integration. Omit for standalone analysis.
+
+`--polyadb`: when provided, PA sites are split into `PA_validated` (within ±50bp of a PolyASite 2.0 entry) and `PA_novel`. Download PolyASite 2.0 (hg38):
+
+```bash
+curl -L https://polyasite.unibas.ch/download/atlas/2.0/GRCh38.96/atlas.clusters.2.0.GRCh38.96.bed.gz \
+     -o data/polyasite2_hg38.bed.gz && gunzip data/polyasite2_hg38.bed.gz
 ```
 
 ### Step 4: Downstream analysis (Python)
 
 ```python
 import scanpy as sc
-import anndata as ad
+import numpy as np
 
 # IsoCAPE output
 cape = sc.read_h5ad("results/patient_01_cape.h5ad")
 
-# Filter low-confidence sites (same as scanpy standard)
+# Filter low-confidence sites
 sc.pp.filter_genes(cape, min_cells=3)
 
-# CE sites only (intronic premature polyadenylation)
+# Site type breakdown
+print(cape.var['site_type'].value_counts())
+# CE              7,823
+# PA_validated   31,241
+# PA_novel       76,580
+# known          37,512
+
+# CE sites only (most reliable)
 ce = cape[:, cape.var['site_type'] == 'CE']
+
+# CE fraction per gene: CE / (CE + PA + known)
+def ce_fraction(gene, cape):
+    ce  = cape[:, (cape.var['gene']==gene) & (cape.var['site_type']=='CE')].X.sum()
+    pa  = cape[:, (cape.var['gene']==gene) & cape.var['site_type'].isin(['PA','PA_validated','PA_novel'])].X.sum()
+    kn  = cape[:, (cape.var['gene']==gene) & (cape.var['site_type']=='known')].X.sum()
+    return float(ce / (ce + pa + kn)) if (ce + pa + kn) > 0 else 0
 
 # Check AR-V7 status per cell
 ar_v7 = ce[:, ce.var_names.str.startswith('AR_CE')]
 
-# Combine with IsoDecipher output
-apa = sc.read_h5ad("isodecipher_output.h5ad")
-combined = ad.concat([apa, cape], axis=1)
+# Integration with IsoDecipher (via obsm layers — no concat needed)
+adata_gex = sc.read_h5ad("gex_annotated.h5ad")
+# adata_gex.obsm['isocape']  → IsoCAPE matrix (cells × sites)
+# adata_gex.obsm['isoform']  → IsoDecipher matrix (cells × G-groups)
+# adata_gex.uns['isocape_features'] → site names
+# adata_gex.uns['isocape_var']      → site metadata
 ```
 
 ---
@@ -226,12 +290,12 @@ combined = ad.concat([apa, cape], axis=1)
 
 | Site type | Example ID | Meaning |
 |-----------|-----------|---------|
-| CE (Cryptic Exon) | `AR_CE3` | Intronic termination + PAS signal — premature polyadenylation |
-| PA (Alternative PA) | `BRAF_PA1` | Genic termination at unannotated position + PAS signal — shorter UTR, longer UTR, or alternative last exon |
+| `CE` | `MXD4_CE_2254615` | Intronic termination + PAS signal — premature polyadenylation. Three independent filters: intron membership, exon exclusion, GN tag consistency. Most reliable site type. |
+| `PA_validated` | `ESR1_PA_152103175` | Genic + PAS, within ±50bp of a PolyASite 2.0 entry. Known alternative polyA site. |
+| `PA_novel` | `TP53_PA_7676520` | Genic + PAS, no database match. Candidate novel APA site; treat with caution (see Caveats). |
+| `known` | `FUS_known_31191575` | Read terminates within ±50bp of a GTF protein-coding transcript 3' end. Used as reference signal and CE fraction denominator. |
 
-Both CE and PA sites are absent from GTF annotation. IsoDecipher handles annotated 3' ends (G-groups); IsoCAPE handles everything else within gene boundaries.
-
-Coordinate information (`chrom`, `ref_end`, `strand`) is stored in `adata.var` for all sites, enabling IGV inspection and future annotation.
+Site names embed the representative cleavage coordinate for cross-run stability. Coordinate-based naming ensures the same site receives the same ID across samples and pipeline versions.
 
 ---
 
@@ -257,22 +321,96 @@ The label file is a plain CSV — contributions welcome via pull request.
 IsoCAPE and IsoDecipher have a clean division of labour:
 
 - **IsoDecipher** quantifies APA at annotated 3' ends — GTF-anchored, high-fidelity G-groups
-- **IsoCAPE** detects APA at unannotated positions — CE and PA sites the GTF misses
+- **IsoCAPE** detects APA at unannotated positions — CE and PA sites the GTF misses, plus `known` sites as reference signal
 
-The ±10bp window in IsoCAPE's site annotator matches IsoDecipher's clustering tolerance exactly, ensuring **zero overlap** between their outputs. Their AnnData objects share the same structure and concatenate directly:
+The recommended integration stores both modalities as `obsm` layers in the GEX AnnData object, avoiding axis-1 concatenation:
 
 ```python
-import anndata as ad
 import scanpy as sc
+import scipy.sparse as sp
+import numpy as np
 
-apa  = sc.read_h5ad("isodecipher_output.h5ad")   # annotated APA (G-groups)
-cape = sc.read_h5ad("isocape_output.h5ad")         # cryptic sites (CE + PA)
+# Load
+adata_gex = sc.read_h5ad("gex_annotated.h5ad")   # GEX (preprocessed)
+cape       = sc.read_h5ad("isocape_output.h5ad")   # IsoCAPE
+apa        = sc.read_h5ad("isodecipher_output.h5ad") # IsoDecipher
 
-combined = ad.concat([apa, cape], axis=1)
-# combined.var['feature_types'] distinguishes the two
+# Align barcodes (IsoCAPE/IsoDecipher use SAMPLE_BARCODE format)
+adata_gex.obs_names = ['SAMPLE_' + bc.replace('-1','') for bc in adata_gex.obs_names]
+
+common_cape = adata_gex.obs_names.intersection(cape.obs_names)
+common_apa  = adata_gex.obs_names.intersection(apa.obs_names)
+
+# IsoCAPE layer
+cell_to_idx = {c: i for i, c in enumerate(adata_gex.obs_names)}
+cape_mat = sp.lil_matrix((adata_gex.n_obs, cape.n_vars), dtype='float32')
+for cell in common_cape:
+    cape_mat[cell_to_idx[cell]] = cape[cell].X
+adata_gex.obsm['isocape'] = sp.csr_matrix(cape_mat)
+adata_gex.uns['isocape_features'] = cape.var_names.tolist()
+adata_gex.uns['isocape_var']      = cape.var.to_dict()
+
+# IsoDecipher layer
+iso_feats = apa.var_names[apa.var['feature_types'] == 'Isoform']
+iso_mat = sp.lil_matrix((adata_gex.n_obs, len(iso_feats)), dtype='float32')
+for cell in common_apa:
+    iso_mat[cell_to_idx[cell]] = apa[cell, iso_feats].X
+adata_gex.obsm['isoform'] = sp.csr_matrix(iso_mat)
+adata_gex.uns['isoform_features'] = iso_feats.tolist()
 ```
 
 IsoCAPE CE and PA sites are also candidate vocabulary entries for **IsoFormer** — the foundation model learns from both annotated and cryptic termination events across normal differentiation and malignancy.
+
+---
+
+## Caveats
+
+### CE sites are more reliable than PA sites
+
+CE sites pass **three independent filters** before PAS verification:
+
+1. Must fall inside a `protein_coding` intron (`intron_trees`)
+2. Must NOT overlap any exon of protein-coding, NMD, or non_stop_decay transcripts (`exon_trees`)
+3. GN tag must match the intron's gene — neighboring-gene reads are excluded
+
+PA sites require only: genic position + PAS signal + distance > 50bp from any known 3' end.
+
+**Recommendation:** Use CE sites as the primary feature of interest. Apply stricter filtering for PA sites:
+
+```python
+# PA analysis: use only validated sites
+pa_val = cape[:, cape.var['site_type'] == 'PA_validated']
+sc.pp.filter_genes(pa_val, min_cells=10)  # stricter threshold
+```
+
+### Internal priming detection is incomplete
+
+`bam_to_parquet` flags reads with ≥8 consecutive A's in the 20bp downstream genomic sequence as `INTERNAL_PRIME`. This catches obvious genomic polyA tracts but **does not capture**:
+
+- Non-consecutive A-rich regions (e.g. `AATAAA…AAAAA` patterns)
+- PAS signals that coincide with moderate A-rich context
+
+Consequence: some CE and PA sites may reflect oligo-dT mispriming rather than genuine polyadenylation, particularly in A-rich intronic regions. The correlation between CE reads and GEX expression is a useful but imperfect diagnostic — genuine internal priming typically shows high CE/GEX correlation, but expression-linked CE events also exist.
+
+**Future improvement:** sequence-context priming probability model (planned for IsoCAPE v2).
+
+### Non-tumor reference is required for cancer-specificity assessment
+
+IsoCAPE detects **CE usage**, not cancer-specific CE upregulation. Many CE sites are constitutive (present in all cell types) or reflect cell-type-specific APA rather than cancer biology. To identify cancer-specific events:
+
+1. Compare CE fraction (CE / CE+PA+known) between tumor and non-tumor cells in the same dataset
+2. Validate with IGV: cancer-specific sites should show a pileup in tumor BAM but not in matched normal or PBMC BAM
+3. Use non-tumor cells within the dataset (macrophages, stromal cells) as an internal reference
+
+Sites confirmed by both approaches (statistical enrichment + IGV) are high-confidence cancer-specific CE events.
+
+### 3' scRNA-seq limitations
+
+IsoCAPE is optimized for 10x Genomics 3' scRNA-seq (Chromium v2/v3). Limitations:
+
+- **Sparse per-cell signal:** most genes have 1–5 UMI per cell; per-cell CE fraction is unreliable. Use pseudo-bulk (sum across cell type) for quantification.
+- **3' bias:** only the terminal ~500bp of each transcript is captured; IsoCAPE cannot distinguish CE events near the annotated 3' end from normal APA.
+- **Validation recommended:** bulk 3'-seq (QuantSeq, PAPERCLIP) or long-read sequencing (PacBio/Nanopore) should be used to confirm high-priority CE candidates.
 
 ---
 
@@ -282,13 +420,20 @@ IsoCAPE CE and PA sites are also candidate vocabulary entries for **IsoFormer** 
 IsoCAPE/
 ├── IsoCAPE/
 │   └── scripts/
-│       ├── bam_to_parquet.py           # Step 1: BAM → reads parquet (parallel streaming)
-│       ├── bam_to_parquet_parallel.py  # Step 1: parallel version (multi-core)
+│       ├── bam_to_parquet.py           # Step 1: BAM → reads parquet
+│       ├── bam_to_parquet_parallel.py  # Step 1: parallel multi-core version
+│       ├── build_matrix.py             # Step 3: parquet → AnnData (.h5ad)
 │       └── annotator/
 │           ├── gtf_parser.py           # GTF/DB index builder
-│           └── site_annotator.py       # Step 2: cryptic site annotation (CE + PA)
+│           │   # intron_trees: protein_coding
+│           │   # exon_trees: protein_coding + NMD + non_stop_decay
+│           │   # known_3p_ends: protein_coding tx_biotype only
+│           └── site_annotator.py       # Step 2: CE / PA / known annotation
+│               # PAS_WINDOW=60bp, PAS_MIN_DIST=10bp
+│               # known-window=50bp
+│               # GN tag consistency filter
 ├── notebooks/
-│   └── 01_AR-V7_demo.ipynb            # Validation: AR-V7 detection in CRPC dataset
+│   └── 01_AR-V7_demo.ipynb            # Validation: AR-V7 detection in CRPC
 ├── data/
 │   └── cape_labels.csv                # Curated clinical label layer
 ├── results/
@@ -299,7 +444,63 @@ IsoCAPE/
 
 ---
 
-## Future Directions
+## Results: Cryptic Polyadenylation in IDC Breast Cancer
+
+IsoCAPE was applied to a public 10x Genomics 3' scRNA-seq dataset from invasive ductal carcinoma (IDC) breast cancer (5,680 cells, Cell Ranger v2, hg38). After QC and doublet removal, 2,974 cells were retained across 11 annotated cell types.
+
+Candidate CE sites were first ranked by total read count and filtered by **tumor-versus-non-tumor** CE fraction differential (non-tumor reference: macrophages + stromal cells within the same dataset). Top candidates were further validated by IGV comparison against **healthy** PBMC and B cell/plasma cell BAM files. Two events satisfied all criteria for high-confidence cancer-specific cryptic polyadenylation:
+
+---
+
+### MXD4 — MYC antagonist inactivated by intronic polyadenylation
+
+**MXD4** (MAX Dimerization Protein 4) is a transcriptional repressor that antagonizes MYC activity by competing for MAX binding. It suppresses MYC-dependent cell transformation and is considered a tumor suppressor in multiple cancer contexts.
+
+IsoCAPE detected two CE sites in **transcript intron 3** (chr4, − strand), producing a 3-exon truncated isoform that loses the bHLHZip/MAX binding domain — phenocopying a truncating mutation without any DNA-level alteration.
+
+**Figure 1. MXD4 gene structure and IGV validation**
+
+![MXD4 gene structure and IGV](results/figures/mxd4_structure_igv.png)
+
+*Gene structure (top): CE sites in transcript intron 3. IsoDecipher G1/G2 mark the annotated 3' ends. IGV tracks (bottom): IDC breast cancer shows a prominent CE peak; PBMC and B cell/plasma cell tracks show absent or negligible signal at the CE position — confirming tumor specificity.*
+
+---
+
+**Figure 2. UMAP and cell-type distribution**
+
+![MXD4 DNAAF1 UMAP](results/figures/MDX4_DNAAF1_UMAP.png)
+
+*MXD4 GEX is broadly expressed across tumor and non-tumor cells. MXD4 CE signal is enriched in tumor cells (right), with near-zero signal in macrophages and stromal cells — demonstrating that CE is independent of expression level. DNAAF1 GEX is aberrantly activated in tumor cells; DNAAF1 CE mirrors this tumor-specific pattern.*
+
+---
+
+**Figure 3. Pseudo-bulk CE reads per cell by cell type**
+
+![MXD4 DNAAF1 barplot](results/figures/MXD4_DNAAF1_barplot.pdf)
+
+*MXD4 CE (IsoCAPE, p=1.75×10⁻¹⁰, Mann-Whitney tumor vs non-tumor): tumor cells show 5–8× higher CE signal than macrophages or stromal cells, despite similar GEX levels — confirming cancer-specific intronic polyadenylation. DNAAF1 CE (p=2.21×10⁻¹³): near-zero in non-tumor cells, consistently elevated across all tumor subtypes.*
+
+---
+
+### DNAAF1 — dynein assembly factor aberrantly expressed and truncated in tumor cells
+
+**DNAAF1** (Dynein Axonemal Assembly Factor 1) is required for cytoplasmic preassembly of dynein arms and cilia formation. Its expression is normally restricted to ciliated cell types.
+
+IsoCAPE detected four CE sites in **transcript intron 9** (chr16, + strand), producing a truncated isoform lacking the C-terminal dynein assembly domain (exons 10–13). Two additional findings make this event notable:
+
+1. **Aberrant expression:** DNAAF1 GEX was detected in 61–67% of IDC tumor cells — a cell type that does not normally express this gene — suggesting de-differentiation or oncogenic transcriptional reprogramming.
+2. **Tumor-specific CE:** PBMC and B cell BAM files show no DNAAF1 reads at the CE position, consistent with absence of the gene in immune cells. The CE fraction in tumor cells is therefore meaningful without a direct matched-normal comparison.
+
+These findings are consistent with a model in which tumor cells aberrantly activate DNAAF1 transcription and simultaneously truncate the resulting transcript via intronic polyadenylation — a double hit on a gene whose full-length product may constrain cell motility or secretory pathway function.
+
+| Gene | CE position | Intron | Non-tumor CE | Tumor CE | p-value |
+|------|-------------|--------|-------------|----------|---------|
+| MXD4 | chr4:2,254,615 (dominant) | transcript intron 3 | 0.009 | 0.141 | 1.75×10⁻¹⁰ |
+| DNAAF1 | chr16:84,173,338 (dominant) | transcript intron 9 | 0.006 | 0.178 | 2.21×10⁻¹³ |
+
+*CE signal = mean CE reads per cell. p-value: Mann-Whitney U, tumor vs non-tumor cells.*
+
+---
 
 - **Mouse / multi-species support** — mm10 GTF + reference genome
 - **Spatial transcriptomics** — Visium BAM compatibility (spot-level APA resolution across tissue sections)

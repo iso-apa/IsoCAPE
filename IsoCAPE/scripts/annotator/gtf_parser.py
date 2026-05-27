@@ -1,37 +1,40 @@
 #!/usr/bin/env python3
 """
-IsoCAPE: GTF Parser
---------------------
-Builds two lookup structures for site annotation:
+IsoCAPE: GTF Parser (with interval tree for fast intron lookup)
+---------------------------------------------------------------
+Builds two lookup structures:
 
-1. known_3p_ends  — {chrom: [(pos, strand, gene_name, transcript_id), ...]}
-2. intron_index   — {chrom: [(start, end, strand, gene_name, transcript_id), ...]}
+1. known_3p_ends  — {chrom: sorted list of (pos, strand, gene, tx_id)}
+                    queried with binary search (bisect)
 
-Supports two input modes:
-  - GTF file (.gtf or .gtf.gz)   → parsed directly
-  - gffutils DB (.gtf.db)        → faster, recommended if available
+2. intron_trees   — {chrom: {strand: IntervalTree}}
+                    queried with interval tree O(log n) instead of O(n)
+
+Chromosome names are normalized to UCSC style (chr-prefix) so
+Ensembl GTF ('1','X','MT') matches Cell Ranger BAM ('chr1','chrX','chrM').
+
+Supports GTF file or gffutils DB input.
 
 Usage:
     from gtf_parser import GTFParser
 
-    # With db (fast, recommended)
     parser = GTFParser(gtf_path="hg38.gtf", db_path="hg38.gtf.db")
     parser.build()
 
-    # GTF only
-    parser = GTFParser(gtf_path="hg38.gtf")
-    parser.build()
-
-    # Query
-    matches = parser.query_3p_end("chr7", 140453136, "+", window=20)
+    matches = parser.query_3p_end("chr17", 41196312, "-", window=10)
     introns = parser.query_intron("chrX", 66765940, "-")
 """
 
 import gzip
+import bisect
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+
+# ---------------------------------------------------------------------------
+# TranscriptModel
+# ---------------------------------------------------------------------------
 
 @dataclass
 class TranscriptModel:
@@ -39,6 +42,7 @@ class TranscriptModel:
     transcript_id: str
     chrom:         str
     strand:        str
+    tx_biotype:    str = 'protein_coding'  # transcript-level biotype
     exons:         List[Tuple[int, int]] = field(default_factory=list)
 
     def three_prime_end(self) -> int:
@@ -59,9 +63,95 @@ class TranscriptModel:
         ]
 
 
+# ---------------------------------------------------------------------------
+# Simple interval tree (no external dependency)
+# ---------------------------------------------------------------------------
+
+class IntervalNode:
+    """Node in an augmented interval tree (center-based)."""
+    __slots__ = ['center', 'intervals', 'left', 'right']
+
+    def __init__(self, center):
+        self.center    = center
+        self.intervals = []   # [(start, end, data), ...]
+        self.left      = None
+        self.right     = None
+
+
+class IntervalTree:
+    """
+    Static interval tree for fast overlap queries.
+    Build once, query many times.
+    Each interval stores (start, end, data).
+    query(pos) returns all intervals containing pos.
+    """
+
+    def __init__(self):
+        self._intervals = []
+        self._root      = None
+        self._built     = False
+
+    def add(self, start: int, end: int, data):
+        self._intervals.append((start, end, data))
+
+    def build(self):
+        if self._intervals:
+            self._root = self._build(self._intervals)
+        self._built = True
+
+    def _build(self, intervals):
+        if not intervals:
+            return None
+        # Choose center as median of interval midpoints
+        center = sorted((s + e) // 2 for s, e, _ in intervals)[len(intervals) // 2]
+        node   = IntervalNode(center)
+        left_ivs  = []
+        right_ivs = []
+        for iv in intervals:
+            s, e, d = iv
+            if e < center:
+                left_ivs.append(iv)
+            elif s > center:
+                right_ivs.append(iv)
+            else:
+                node.intervals.append(iv)
+        node.left  = self._build(left_ivs)
+        node.right = self._build(right_ivs)
+        return node
+
+    def query(self, pos: int) -> list:
+        results = []
+        self._query(self._root, pos, results)
+        return results
+
+    def _query(self, node, pos, results):
+        if node is None:
+            return
+        if pos < node.center:
+            for s, e, d in node.intervals:
+                if s <= pos:
+                    results.append(d)
+            self._query(node.left, pos, results)
+        elif pos > node.center:
+            for s, e, d in node.intervals:
+                if e >= pos:  # ← include endpoint (closed interval)
+                    results.append(d)
+            self._query(node.right, pos, results)
+        else:
+            for s, e, d in node.intervals:
+                results.append(d)
+
+    def __len__(self):
+        return len(self._intervals)
+
+
+# ---------------------------------------------------------------------------
+# GTFParser
+# ---------------------------------------------------------------------------
+
 class GTFParser:
     """
-    Parses GTF or gffutils DB and builds lookup structures for IsoCAPE.
+    Parses GTF or gffutils DB and builds fast lookup structures.
 
     Parameters
     ----------
@@ -78,11 +168,42 @@ class GTFParser:
     ):
         self.gtf_path   = gtf_path
         self.db_path    = db_path
+
+        # gene_types for known_3p_ends and intron_trees
+        # Strict: only protein_coding transcripts define known APA sites and CE candidates
         self.gene_types = gene_types or ["protein_coding"]
 
-        self.known_3p_ends: Dict[str, List[Tuple[int, str, str, str]]] = defaultdict(list)
-        self.intron_index:  Dict[str, List[Tuple[int, int, str, str, str]]] = defaultdict(list)
-        self._transcripts:  Dict[str, TranscriptModel] = {}
+        # exon_types for exon_trees — inclusive but conservative
+        # Purpose: prevent false CE calls
+        # Include: protein_coding related biotypes only
+        # Exclude: lncRNA (too aggressive, overlaps protein_coding introns)
+        #          retained_intron (IS the intron — would kill real CE calls)
+        #          TEC (unconfirmed)
+        self.exon_types = {
+            "protein_coding",
+            "protein_coding_CDS_not_defined",
+            "protein_coding_LoF",
+            "nonsense_mediated_decay",  # NMD isoforms of protein_coding genes
+            "non_stop_decay",           # NSD isoforms of protein_coding genes
+        }
+
+        # known_3p_ends: {chrom: sorted list of (pos, strand, gene, tx_id)}
+        # sorted by pos for binary search
+        self.known_3p_ends: Dict[str, List] = defaultdict(list)
+
+        # intron_trees: {chrom: {strand: IntervalTree}}
+        self.intron_trees: Dict[str, Dict[str, IntervalTree]] = defaultdict(
+            lambda: {'+': IntervalTree(), '-': IntervalTree()}
+        )
+
+        # exon_trees: {chrom: {strand: IntervalTree}}
+        # Used to check if a position is in ANY exon across all transcripts
+        # CE requires: intronic + NOT in any exon
+        self.exon_trees: Dict[str, Dict[str, IntervalTree]] = defaultdict(
+            lambda: {'+': IntervalTree(), '-': IntervalTree()}
+        )
+
+        self._transcripts: Dict[str, TranscriptModel] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,69 +217,140 @@ class GTFParser:
             print(f"[GTFParser] Parsing GTF: {self.gtf_path}")
             self._parse_gtf()
         self._build_indexes()
-        print(
-            f"[GTFParser] Done. "
-            f"{sum(len(v) for v in self.known_3p_ends.values()):,} known 3' ends | "
-            f"{sum(len(v) for v in self.intron_index.values()):,} introns indexed"
+        n_ends    = sum(len(v) for v in self.known_3p_ends.values())
+        n_introns = sum(
+            len(tree)
+            for strands in self.intron_trees.values()
+            for tree in strands.values()
         )
+        print(f"[GTFParser] Done. {n_ends:,} known 3' ends | {n_introns:,} introns indexed")
 
-    def query_3p_end(self, chrom, pos, strand, window=20):
+    def query_3p_end(self, chrom, pos, strand, window=10):
+        """
+        Binary search for known 3' ends within ±window bp.
+        Returns list of (gene_name, transcript_id).
+        """
+        ends = self.known_3p_ends.get(chrom, [])
+        if not ends:
+            return []
+
+        # Binary search for window
+        lo = bisect.bisect_left(ends,  (pos - window,))
+        hi = bisect.bisect_right(ends, (pos + window,))
+
         matches = []
-        for (end_pos, end_strand, gene_name, tx_id) in self.known_3p_ends.get(chrom, []):
+        for i in range(lo, hi):
+            end_pos, end_strand, gene, tx_id = ends[i]
             if end_strand == strand and abs(end_pos - pos) <= window:
-                matches.append((gene_name, tx_id))
+                matches.append((gene, tx_id))
         return matches
 
     def query_intron(self, chrom, pos, strand):
-        hits = []
-        for (i_start, i_end, i_strand, gene_name, tx_id) in self.intron_index.get(chrom, []):
-            if i_strand == strand and i_start <= pos < i_end:
-                hits.append((gene_name, tx_id))
-        return hits
+        """
+        Interval tree lookup for introns containing pos.
+        Returns list of (gene_name, transcript_id).
+        O(log n + k) where k = number of results.
+        """
+        trees = self.intron_trees.get(chrom)
+        if not trees:
+            return []
+        tree = trees.get(strand)
+        if not tree or not tree._built:
+            return []
+        return tree.query(pos)
+
+    def query_exon(self, chrom, pos, strand):
+        """
+        Interval tree lookup for exons containing pos.
+        Returns list of (gene_name, transcript_id).
+        Used to verify CE sites: a position must be intronic AND
+        NOT in any exon across all transcripts.
+        """
+        trees = self.exon_trees.get(chrom)
+        if not trees:
+            return []
+        tree = trees.get(strand)
+        if not tree or not tree._built:
+            return []
+        return tree.query(pos)
 
     # ------------------------------------------------------------------
-    # DB parsing (fast path)
+    # Chrom normalization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_chrom(chrom: str) -> str:
+        """Ensembl → UCSC: '1' → 'chr1', 'X' → 'chrX', 'MT' → 'chrM'."""
+        if chrom.startswith('chr'):
+            return chrom
+        if chrom == 'MT':
+            return 'chrM'
+        return f"chr{chrom}"
+
+    # ------------------------------------------------------------------
+    # DB parsing (fast)
     # ------------------------------------------------------------------
 
     def _parse_from_db(self) -> None:
         try:
             import gffutils
         except ImportError:
-            print("[GTFParser] gffutils not installed — falling back to GTF parsing.")
+            print("[GTFParser] gffutils not installed — falling back to GTF.")
             self._parse_gtf()
             return
 
         db = gffutils.FeatureDB(self.db_path)
-        n_transcripts = 0
+        n  = 0
+        n_exon_only = 0
 
         for tx in db.features_of_type('transcript'):
-            gene_type = (
-                tx.attributes.get('gene_type',    [None])[0] or
-                tx.attributes.get('gene_biotype', [None])[0] or ''
+            # transcript_biotype for exon_types check (transcript-level)
+            tx_biotype = (
+                tx.attributes.get('transcript_biotype', [None])[0] or
+                tx.attributes.get('gene_type',          [None])[0] or
+                tx.attributes.get('gene_biotype',       [None])[0] or ''
             )
-            if self.gene_types and gene_type not in self.gene_types:
-                continue
+            # gene_biotype for strict filter (gene-level protein_coding)
+            gene_biotype = (
+                tx.attributes.get('gene_biotype', [None])[0] or
+                tx.attributes.get('gene_type',    [None])[0] or ''
+            )
 
             gene_name     = (tx.attributes.get('gene_name', [None])[0] or
                              tx.attributes.get('gene_id',   ['UNK'])[0])
             transcript_id = tx.attributes.get('transcript_id', ['UNK'])[0]
-            chrom         = tx.chrom
+            chrom         = self._normalize_chrom(tx.chrom)
             strand        = tx.strand
             tx_key        = f"{chrom}::{transcript_id}"
+
+            # exon_trees: use transcript_biotype (inclusive)
+            if tx_biotype in self.exon_types:
+                for exon in db.children(tx, featuretype='exon', order_by='start'):
+                    self.exon_trees[chrom][strand].add(
+                        exon.start - 1, exon.end,
+                        (gene_name, transcript_id)
+                    )
+                n_exon_only += 1
+
+            # known_3p_ends + intron_trees: use gene_biotype (strict)
+            if self.gene_types and gene_biotype not in self.gene_types:
+                continue
 
             self._transcripts[tx_key] = TranscriptModel(
                 gene_name=gene_name, transcript_id=transcript_id,
                 chrom=chrom, strand=strand,
+                tx_biotype=tx_biotype,
             )
-
             for exon in db.children(tx, featuretype='exon', order_by='start'):
                 self._transcripts[tx_key].exons.append((exon.start - 1, exon.end))
 
-            n_transcripts += 1
-            if n_transcripts % 50_000 == 0:
-                print(f"  [GTFParser] {n_transcripts:,} transcripts loaded ...")
+            n += 1
+            if n % 50_000 == 0:
+                print(f"  [GTFParser] {n:,} transcripts loaded ...")
 
-        print(f"[GTFParser] Loaded {n_transcripts:,} transcripts from DB")
+        print(f"[GTFParser] Loaded {n:,} protein_coding transcripts from DB")
+        print(f"[GTFParser] Exon index covers {n_exon_only:,} transcripts "
+              f"({', '.join(sorted(self.exon_types))})")
 
     # ------------------------------------------------------------------
     # GTF parsing (fallback)
@@ -179,13 +371,14 @@ class GTFParser:
                 if feature != "exon":
                     continue
 
-                attr_dict     = self._parse_attributes(attrs)
-                gene_type     = attr_dict.get("gene_type") or attr_dict.get("gene_biotype", "")
+                attr_dict = self._parse_attributes(attrs)
+                gene_type = attr_dict.get("gene_type") or attr_dict.get("gene_biotype", "")
                 if self.gene_types and gene_type not in self.gene_types:
                     continue
 
                 gene_name     = attr_dict.get("gene_name", attr_dict.get("gene_id", "UNK"))
                 transcript_id = attr_dict.get("transcript_id", "UNK")
+                chrom         = self._normalize_chrom(chrom)
                 tx_key        = f"{chrom}::{transcript_id}"
 
                 if tx_key not in self._transcripts:
@@ -203,16 +396,52 @@ class GTFParser:
     # ------------------------------------------------------------------
 
     def _build_indexes(self) -> None:
+        print(f"[GTFParser] Building indexes ...")
         for tx in self._transcripts.values():
             if not tx.exons:
                 continue
-            self.known_3p_ends[tx.chrom].append(
-                (tx.three_prime_end(), tx.strand, tx.gene_name, tx.transcript_id)
-            )
-            for (i_start, i_end) in tx.introns():
-                self.intron_index[tx.chrom].append(
-                    (i_start, i_end, tx.strand, tx.gene_name, tx.transcript_id)
+            chrom = tx.chrom
+
+            # known 3' ends — only protein_coding transcripts
+            # Exclude retained_intron, NMD etc. from known 3'end index
+            # to prevent intron reads being mis-labeled as 'known'
+            if tx.tx_biotype == 'protein_coding':
+                self.known_3p_ends[chrom].append(
+                    (tx.three_prime_end(), tx.strand, tx.gene_name, tx.transcript_id)
                 )
+
+            # intron interval trees (protein_coding only)
+            for (i_start, i_end) in tx.introns():
+                self.intron_trees[chrom][tx.strand].add(
+                    i_start, i_end, (tx.gene_name, tx.transcript_id)
+                )
+
+        # Sort known_3p_ends by position for binary search
+        for chrom in self.known_3p_ends:
+            self.known_3p_ends[chrom].sort(key=lambda x: x[0])
+
+        # Build all interval trees
+        print(f"[GTFParser] Building interval trees ...")
+        for chrom, strands in self.intron_trees.items():
+            for strand, tree in strands.items():
+                tree.build()
+
+        for chrom, strands in self.exon_trees.items():
+            for strand, tree in strands.items():
+                tree.build()
+
+        n_introns = sum(
+            len(t._intervals)
+            for strands in self.intron_trees.values()
+            for t in strands.values()
+        )
+        n_exons = sum(
+            len(t._intervals)
+            for strands in self.exon_trees.values()
+            for t in strands.values()
+        )
+        print(f"[GTFParser] Done. {len(self.known_3p_ends):,} chroms | "
+              f"{n_introns:,} introns indexed | {n_exons:,} exons indexed")
 
     @staticmethod
     def _parse_attributes(attr_string: str) -> dict:
@@ -236,17 +465,25 @@ class GTFParser:
 
 if __name__ == "__main__":
     import argparse
+    import time
 
     p = argparse.ArgumentParser(description="IsoCAPE GTF Parser — sanity check")
     p.add_argument("--gtf",    required=True)
-    p.add_argument("--db",     default=None, help="gffutils DB path (optional, faster)")
+    p.add_argument("--db",     default=None)
     p.add_argument("--chrom",  default="chrX")
-    p.add_argument("--pos",    type=int, default=66765940, help="AR locus default")
+    p.add_argument("--pos",    type=int, default=66765940)
     p.add_argument("--strand", default="-")
     args = p.parse_args()
 
+    t0 = time.time()
     gp = GTFParser(gtf_path=args.gtf, db_path=args.db)
     gp.build()
+    print(f"Build time: {time.time()-t0:.1f}s")
+
+    t1 = time.time()
+    for _ in range(10000):
+        gp.query_intron(args.chrom, args.pos, args.strand)
+    print(f"10,000 intron queries: {time.time()-t1:.3f}s")
 
     print(f"\n--- Query: {args.chrom}:{args.pos} ({args.strand}) ---")
     matches = gp.query_3p_end(args.chrom, args.pos, args.strand)
@@ -255,6 +492,6 @@ if __name__ == "__main__":
     else:
         hits = gp.query_intron(args.chrom, args.pos, args.strand)
         if hits:
-            print(f"Intronic (cryptic candidate): {hits}")
+            print(f"Intronic: {hits[:3]}")
         else:
             print("Novel / intergenic")

@@ -1,0 +1,5 @@
+site_id,gene,isoform,label,clinical_relevance,reference
+AR_CE3,AR,AR-V7,Cryptic exon 3 premature polyadenylation,Enzalutamide / abiraterone resistance in CRPC,Dehm et al. Cancer Res 2008 PMID:18519752
+AR_CE1,AR,AR-V1,Cryptic exon 1,Androgen deprivation resistance; significance unclear,Guo et al. Cancer Res 2009 PMID:19487303
+AR_CE2,AR,AR-V9,Cryptic exon 2,Co-occurs with AR-V7; synergistic resistance,Hornberg et al. Cancer Res 2011 PMID:21270108
+RUNX1_CE125,RUNX1,RUNX1a,Alternative terminal exon 7a proximal PAS,Restricted to human CD34+ HSCs; expands HSC self-renewal; leukemic potential; RUNX1 mutations in breast cancer,Shen et al. Blood Adv 2021 PMID:33599727

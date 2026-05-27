@@ -6,19 +6,24 @@ Detects cryptic and alternative polyadenylation sites
 that are NOT recorded in GTF annotation.
 
 Decision logic per read:
-  1. UNK_GENE          → skip (no gene context)
-  2. known 3'end ±10bp → skip (IsoDecipher handles these)
-  3. no PAS signal     → skip (noise)
-  4. intronic + PAS    → GENE_CE (cryptic/premature polyadenylation)
-  5. genic + PAS       → GENE_PA (alternative polyadenylation,
-                          shorter OR longer than annotated 3'end)
+  1. UNK_GENE                    → skip (no gene context)
+  2. known 3'end ±known_window   → known (default 50bp, matches read scatter)
+  3. no PAS signal               → skip (noise)
+  4. intronic + PAS              → CE (not affected by known_window)
+  5. genic + PAS + dist > known_window from any known → PA (truly unannotated)
 
-window default = 10bp to match IsoDecipher's tolerance.
+--known-window 50bp : read scatter window for known 3'end matching.
+  Covers ~20bp biological cleavage variation + ~5bp alignment noise.
+  CE detection is unaffected — intronic reads are CE regardless of
+  distance to known sites.
+  PA = genuinely unannotated, > known_window from any GTF 3'end.
 
-Downstream usage:
-    apa     = sc.read_h5ad("isodecipher_output.h5ad")   # known APA
-    cryptic = sc.read_h5ad("isocape_output.h5ad")        # CE + PA sites
-    combined = ad.concat([apa, cryptic], axis=1)
+
+
+Validation (separate workflow):
+    IsoCAPE known site:  GENE_known_{coord}
+    IsoDecipher G-group: GENE_G0, rep_coord ≈ coord
+    → coord matching → Pearson correlation (target r > 0.99)
 
 Usage:
 python isocape/annotator/site_annotator.py \
@@ -27,7 +32,7 @@ python isocape/annotator/site_annotator.py \
     --db      path/to/Homo_sapiens.GRCh38.115.gtf.db \
     --ref     path/to/ref.fa \
     --out     path/to/cryptic_sites.parquet \
-    [--window 10] \
+
     [--batch-size 500000]
 """
 
@@ -52,7 +57,12 @@ PAS_SIGNALS = {
     "CATAAA", "GATAAA", "AATATA", "AATACA",
     "AATAGA", "AATGAA", "ACTAAA", "AACAAA",
 }
-PAS_WINDOW = 40
+PAS_WINDOW    = 60  # bp upstream of ref_end to scan for PAS signal
+                    # covers ~20bp cleavage variation + ~5bp alignment noise
+                    # + 30bp typical PAS-to-cleavage distance
+PAS_MIN_DIST  = 10  # minimum distance from ref_end to PAS signal
+                    # PAS normally 10-30bp upstream of cleavage site
+                    # signals closer than 10bp are likely false positives
 
 
 # ---------------------------------------------------------------------------
@@ -64,12 +74,14 @@ class SiteRegistry:
     Assigns stable unique names across batches.
     Intronic sites  → GENE_CE1, GENE_CE2 ...
     Genic sites     → GENE_PA1, GENE_PA2 ...
+    Known 3' ends   → GENE_known_1, GENE_known_2 ... (--include-known)
     """
 
     def __init__(self):
-        self._ce_counts   = defaultdict(int)
-        self._pa_counts   = defaultdict(int)
-        self._pos_to_name = {}
+        self._ce_counts    = defaultdict(int)
+        self._pa_counts    = defaultdict(int)
+        self._known_counts = defaultdict(int)
+        self._pos_to_name  = {}
 
     def get_ce(self, gene, chrom, pos, strand):
         key = (gene, chrom, pos, strand, 'ce')
@@ -85,6 +97,13 @@ class SiteRegistry:
             self._pos_to_name[key] = f"{gene}_PA{self._pa_counts[gene]}"
         return self._pos_to_name[key]
 
+    def get_known(self, gene, chrom, pos, strand):
+        key = (gene, chrom, pos, strand, 'known')
+        if key not in self._pos_to_name:
+            self._known_counts[gene] += 1
+            self._pos_to_name[key] = f"{gene}_known_{self._known_counts[gene]}"
+        return self._pos_to_name[key]
+
     @property
     def n_unique(self):
         return len(self._pos_to_name)
@@ -97,12 +116,27 @@ class SiteRegistry:
     def n_pa(self):
         return sum(self._pa_counts.values())
 
+    @property
+    def n_known(self):
+        return sum(self._known_counts.values())
+
 
 # ---------------------------------------------------------------------------
 # PAS signal check
 # ---------------------------------------------------------------------------
 
-def check_pas_signal(fasta, chrom, ref_end, strand, window=PAS_WINDOW):
+def check_pas_signal(fasta, chrom, ref_end, strand, window=PAS_WINDOW,
+                     min_dist=PAS_MIN_DIST):
+    """
+    Scan upstream of ref_end for PAS signal.
+
+    Parameters
+    ----------
+    window   : bp upstream to scan (default 60bp)
+    min_dist : minimum distance from ref_end to PAS (default 10bp)
+               PAS normally 10-30bp upstream of cleavage site.
+               Signals closer than min_dist are likely false positives.
+    """
     try:
         chrom_len = fasta.get_reference_length(chrom)
         if strand == '+':
@@ -115,8 +149,13 @@ def check_pas_signal(fasta, chrom, ref_end, strand, window=PAS_WINDOW):
             upstream    = fasta.fetch(chrom, fetch_start, fetch_end).upper()
             upstream    = upstream[::-1]
 
+        # upstream[-1] is closest to ref_end, upstream[0] is furthest
+        # min_dist: PAS must be at least min_dist bp from ref_end
+        # i.e. PAS must be in upstream[0 : len(upstream) - min_dist]
+        search_region = upstream[:len(upstream) - min_dist]
+
         for signal in PAS_SIGNALS:
-            if signal in upstream:
+            if signal in search_region:
                 return signal
         return None
     except Exception:
@@ -127,10 +166,16 @@ def check_pas_signal(fasta, chrom, ref_end, strand, window=PAS_WINDOW):
 # Annotate one batch
 # ---------------------------------------------------------------------------
 
-def annotate_batch(df, parser, fasta, registry, window):
+def annotate_batch(df, parser, fasta, registry, known_window=50):
     """
-    Returns DataFrame of IsoCAPE sites (CE + PA) only.
-    Skips: UNK_GENE, known 3'ends, no-PAS reads.
+    Returns DataFrame: known + CE + PA.
+
+    known_window: distance from GTF 3'end for known site matching (default 50bp)
+                  covers 90bp read positional scatter
+    CE is window-independent — intronic reads are CE regardless of
+    distance to known sites.
+
+    PA = genic + PAS + distance > known_window from any known 3'end
     """
     import pandas as pd
 
@@ -142,28 +187,60 @@ def annotate_batch(df, parser, fasta, registry, window):
         strand  = row.strand
         gn      = row.gn
 
-        # 1. Skip UNK_GENE — no gene context
+        # 1. Skip UNK_GENE
         if gn == 'UNK_GENE':
             continue
 
-        # 2. Skip known 3'ends (±window = IsoDecipher's territory)
-        if parser.query_3p_end(chrom, ref_end, strand, window=window):
+        # 2. Known 3'end check — use known_window (read scatter)
+        known_hits = parser.query_3p_end(chrom, ref_end, strand, window=known_window)
+        if known_hits:
+            gene    = known_hits[0][0]
+            site_id = registry.get_known(gene, chrom, ref_end, strand)
+            rows.append({
+                'cb':        row.cb,
+                'ub':        row.ub,
+                'gn':        gn,
+                'chrom':     chrom,
+                'ref_end':   ref_end,
+                'strand':    strand,
+                'site_id':   site_id,
+                'site_type': 'known',
+                'pas_signal': None,
+                'gene':      gene,
+            })
             continue
 
-        # 3. PAS signal required
+        # 3. PAS signal required for CE and PA
         pas = check_pas_signal(fasta, chrom, ref_end, strand)
         if not pas:
             continue
 
         # 4. Classify: intronic (CE) or genic (PA)
+        # CE requires:
+        #   a) in protein_coding intron (query_intron hit)
+        #   b) NOT in any exon (query_exon check)
+        #   c) GN tag matches intron gene (consistency check)
+        #      → prevents neighboring gene reads being mis-assigned
         intron_hits = parser.query_intron(chrom, ref_end, strand)
         if intron_hits:
-            gene    = intron_hits[0][0]
-            site_id = registry.get_ce(gene, chrom, ref_end, strand)
-            site_type = 'CE'
+            exon_hits = parser.query_exon(chrom, ref_end, strand)
+            if not exon_hits:
+                intron_gene = intron_hits[0][0]
+                # GN tag must match intron gene — else skip (neighboring gene noise)
+                if gn == intron_gene:
+                    site_id   = registry.get_ce(intron_gene, chrom, ref_end, strand)
+                    site_type = 'CE'
+                    gene      = intron_gene
+                else:
+                    continue  # GN tag mismatch → skip
+            else:
+                # In exon of some transcript → PA
+                gene      = gn
+                site_id   = registry.get_pa(gene, chrom, ref_end, strand)
+                site_type = 'PA'
         else:
-            gene    = gn  # use Cell Ranger GN tag
-            site_id = registry.get_pa(gene, chrom, ref_end, strand)
+            gene      = gn
+            site_id   = registry.get_pa(gene, chrom, ref_end, strand)
             site_type = 'PA'
 
         rows.append({
@@ -215,9 +292,11 @@ def parse_args():
     parser.add_argument("--db",         default=None)
     parser.add_argument("--ref",        required=True)
     parser.add_argument("--out",        required=True)
-    parser.add_argument("--window",     type=int, default=10,
-                        help="bp tolerance for known 3' end match "
-                             "(default: 10, matches IsoDecipher tolerance)")
+    parser.add_argument("--known-window", type=int, default=50,
+                        help="Read scatter window for known 3' end matching (default: 50bp). "
+                             "Reads within this distance of a GTF annotated 3'end are labeled "
+                             "'known'. Should match read length (~90bp for 10x v3). "
+                             "CE detection is unaffected by this parameter.")
     parser.add_argument("--batch-size", type=int, default=500_000)
     parser.add_argument("--include-no-ref", action="store_true",
                         help="Include NO_REF reads (chrom not in reference FASTA). "
@@ -251,9 +330,9 @@ def main():
     total_sites = 0
     batch_num   = 0
 
-    print(f"[IsoCAPE] Streaming (batch={args.batch_size:,}, window=±{args.window}bp)")
-    print(f"[IsoCAPE] Skipping: UNK_GENE | known 3'ends | no PAS signal")
-    print(f"[IsoCAPE] Keeping:  intronic+PAS → CE | genic+PAS → PA")
+    print(f"[IsoCAPE] Streaming (batch={args.batch_size:,}, known_window=±{args.known_window}bp)")
+    print(f"[IsoCAPE] Output: known + CE + PA")
+    print(f"[IsoCAPE] Skipping: UNK_GENE | no PAS signal (for CE/PA)")
 
     for batch in pf.iter_batches(batch_size=args.batch_size):
         import pandas as pd
@@ -269,7 +348,10 @@ def main():
 
         df = df.drop(columns=['sequence'], errors='ignore')
 
-        df_out = annotate_batch(df, gtf_parser, fasta, registry, args.window)
+        df_out = annotate_batch(
+            df, gtf_parser, fasta, registry,
+            known_window=args.known_window
+        )
 
         if df_out is None or df_out.empty:
             continue
@@ -285,6 +367,7 @@ def main():
               f"reads={total_reads:,} | "
               f"valid={total_valid:,} | "
               f"sites={total_sites:,} | "
+              f"known={registry.n_known:,} "
               f"CE={registry.n_ce:,} PA={registry.n_pa:,} | "
               f"unique={registry.n_unique:,}")
 
@@ -297,6 +380,7 @@ def main():
     print(f"  Total reads:        {total_reads:,}")
     print(f"  VALID_PAS reads:    {total_valid:,}")
     print(f"  IsoCAPE site reads: {total_sites:,}")
+    print(f"  Unique known sites: {registry.n_known:,}")
     print(f"  Unique CE sites:    {registry.n_ce:,}")
     print(f"  Unique PA sites:    {registry.n_pa:,}")
     print(f"  Total unique sites: {registry.n_unique:,}")
