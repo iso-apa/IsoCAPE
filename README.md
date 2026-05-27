@@ -476,7 +476,7 @@ IsoCAPE detected two CE sites in **transcript intron 3** (chr4, − strand), pro
 
 **Figure 3. Pseudo-bulk CE reads per cell by cell type**
 
-![MXD4 DNAAF1 barplot](results/figures/MXD4_DNAAF1_barplot.pdf)
+![MXD4 DNAAF1 barplot](results/figures/MXD4_DNAAF1_barplot.png)
 
 *MXD4 CE (IsoCAPE, p=1.75×10⁻¹⁰, Mann-Whitney tumor vs non-tumor): tumor cells show 5–8× higher CE signal than macrophages or stromal cells, despite similar GEX levels — confirming cancer-specific intronic polyadenylation. DNAAF1 CE (p=2.21×10⁻¹³): near-zero in non-tumor cells, consistently elevated across all tumor subtypes.*
 
