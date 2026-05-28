@@ -448,44 +448,47 @@ Candidate CE sites were first ranked by total read count and filtered by **tumor
 
 ### MXD4 — MYC antagonist inactivated by intronic polyadenylation
 
-**MXD4** (MAX Dimerization Protein 4) is a transcriptional repressor that antagonizes MYC activity by competing for MAX binding. It suppresses MYC-dependent cell transformation and is considered a tumor suppressor in multiple cancer contexts.
+**MXD4** (MAX Dimerization Protein 4) is a transcriptional repressor and member of the MYC-MAX-MAD network. It antagonizes MYC oncogenic activity by competing for MAX binding, suppressing MYC-dependent transcriptional activation and cell transformation. Loss of MXD4 function — through mutation, deletion, or epigenetic silencing — relieves this brake on MYC, contributing to uncontrolled proliferation. MXD4 inactivation by intronic polyadenylation has been described in CLL (Lee et al., *Nature* 2018) and is now identified here in IDC breast cancer.
 
-IsoCAPE detected two CE sites in **transcript intron 3** (chr4, − strand), producing a 3-exon truncated isoform that loses the bHLHZip/MAX binding domain — phenocopying a truncating mutation without any DNA-level alteration.
-
-**Figure 1. MXD4 gene structure and IGV validation**
-
-![MXD4 gene structure and IGV](results/figures/mxd4_structure_igv.png)
-
-*Gene structure (top): CE sites in transcript intron 3. IsoDecipher G1/G2 mark the annotated 3' ends. IGV tracks (bottom): IDC breast cancer shows a prominent CE peak; PBMC and B cell/plasma cell tracks show absent or negligible signal at the CE position — confirming tumor specificity.*
-
----
-
-**Figure 2. UMAP and cell-type distribution**
-
-![MXD4 DNAAF1 UMAP](results/figures/MDX4_DNAAF1_UMAP.png)
-
-*MXD4 GEX is broadly expressed across tumor and non-tumor cells. MXD4 CE signal is enriched in tumor cells (right), with near-zero signal in macrophages and stromal cells — demonstrating that CE is independent of expression level. DNAAF1 GEX is aberrantly activated in tumor cells; DNAAF1 CE mirrors this tumor-specific pattern.*
-
----
-
-**Figure 3. Pseudo-bulk CE reads per cell by cell type**
-
-![MXD4 DNAAF1 barplot](results/figures/MXD4_DNAAF1_barplot.png)
-
-*MXD4 CE (IsoCAPE, p=1.75×10⁻¹⁰, Mann-Whitney tumor vs non-tumor): tumor cells show 5–8× higher CE signal than macrophages or stromal cells, despite similar GEX levels — confirming cancer-specific intronic polyadenylation. DNAAF1 CE (p=2.21×10⁻¹³): near-zero in non-tumor cells, consistently elevated across all tumor subtypes.*
+IsoCAPE detected two CE sites in **transcript intron 3** (chr4, − strand). Premature termination at this position retains only exons 1–3, producing a 3-exon isoform that lacks the bHLHZip domain required for MAX binding. This truncated protein cannot compete with MYC for MAX — functionally equivalent to loss of MXD4 — without any underlying DNA mutation.
 
 ---
 
 ### DNAAF1 — dynein assembly factor aberrantly expressed and truncated in tumor cells
 
-**DNAAF1** (Dynein Axonemal Assembly Factor 1) is required for cytoplasmic preassembly of dynein arms and cilia formation. Its expression is normally restricted to ciliated cell types.
+**DNAAF1** (Dynein Axonemal Assembly Factor 1) orchestrates the cytoplasmic preassembly of dynein arm complexes required for ciliary motility. Its expression is normally restricted to ciliated epithelial cells and is absent from immune cells and most stromal populations. Loss-of-function mutations cause Primary Ciliary Dyskinesia (PCD), underscoring its non-redundant role in dynein biogenesis. In cancer, cilia loss is a hallmark of epithelial de-differentiation; the molecular drivers of this loss remain incompletely understood.
 
-IsoCAPE detected four CE sites in **transcript intron 9** (chr16, + strand), producing a truncated isoform lacking the C-terminal dynein assembly domain (exons 10–13). Two additional findings make this event notable:
+IsoCAPE detected four CE sites clustered in **transcript intron 9** (chr16, + strand), producing a truncated isoform that retains exons 1–9 but loses exons 10–13, including the C-terminal dynein assembly domain. Two features make this event particularly notable: DNAAF1 is aberrantly expressed in 61–67% of IDC tumor cells despite being absent from macrophages and stromal cells in the same dataset, and the CE event is confirmed tumor-specific by IGV. This constitutes a double hit — aberrant transcriptional activation paired with immediate isoform truncation — on a gene whose full-length product may normally constrain cell motility or vesicle trafficking.
 
-1. **Aberrant expression:** DNAAF1 GEX was detected in 61–67% of IDC tumor cells — a cell type that does not normally express this gene — suggesting de-differentiation or oncogenic transcriptional reprogramming.
-2. **Tumor-specific CE:** PBMC and B cell BAM files show no DNAAF1 reads at the CE position, consistent with absence of the gene in immune cells. The CE fraction in tumor cells is therefore meaningful without a direct matched-normal comparison.
+---
 
-These findings are consistent with a model in which tumor cells aberrantly activate DNAAF1 transcription and simultaneously truncate the resulting transcript via intronic polyadenylation — a double hit on a gene whose full-length product may constrain cell motility or secretory pathway function.
+### Figures
+
+**Figure 1. MXD4 gene structure and IGV validation**
+
+![MXD4 gene structure and IGV](results/figures/mxd4_structure_igv.png)
+
+*Top: MXD4 gene structure (chr4, − strand, 6 exons). CE sites lie in transcript intron 3; the 3-exon truncated isoform loses the bHLHZip/MAX binding domain. IsoDecipher G1 (UTR=316bp, dominant) and G2 (UTR=1097bp) mark the annotated 3' ends. Bottom: IGV coverage tracks at the CE region. IDC breast cancer (red) shows a prominent pileup at both CE sites. PBMC (blue) and B cell/plasma cell (green) tracks show absent signal at the CE position despite MXD4 being expressed in these cell types — confirming tumor-specific intronic polyadenylation.*
+
+---
+
+**Figure 2. Single-cell UMAP: GEX vs CE signal**
+
+![MXD4 DNAAF1 UMAP](results/figures/MDX4_DNAAF1_UMAP.png)
+
+*MXD4 (top row): GEX is broadly distributed across all cell types, whereas CE signal is enriched in tumor cells and near-absent in macrophages and stromal cells — demonstrating that CE is a tumor-specific event independent of expression level. DNAAF1 (bottom row): GEX is aberrantly activated in tumor cells (absent in immune/stromal populations); CE signal mirrors this tumor-restricted pattern, concentrated in the same cells that aberrantly express the gene.*
+
+---
+
+**Figure 3. Pseudo-bulk CE signal by cell type**
+
+![MXD4 DNAAF1 barplot](results/figures/MXD4_DNAAF1_barplot.png)
+
+*Mean CE reads per cell across all annotated cell types (gray: non-tumor; red: tumor subtypes). MXD4 GEX is similar across cell types, yet MXD4 CE is 5–8× higher in tumor cells than in macrophages or stromal cells (Mann-Whitney U, p=1.75×10⁻¹⁰) — dissociating CE from expression level and implicating a tumor-specific splicing/polyadenylation mechanism. DNAAF1 CE is near-zero in all non-tumor cells and consistently elevated across every tumor subtype (p=2.21×10⁻¹³), consistent with the absence of DNAAF1 expression in immune and stromal populations.*
+
+---
+
+### Summary
 
 | Gene | CE position | Intron | Non-tumor CE | Tumor CE | p-value |
 |------|-------------|--------|-------------|----------|---------|
@@ -493,6 +496,8 @@ These findings are consistent with a model in which tumor cells aberrantly activ
 | DNAAF1 | chr16:84,173,338 (dominant) | transcript intron 9 | 0.006 | 0.178 | 2.21×10⁻¹³ |
 
 *CE signal = mean CE reads per cell. p-value: Mann-Whitney U, tumor vs non-tumor cells.*
+
+Both events share a common theme: intronic polyadenylation as a mechanism to inactivate or truncate genes with potential tumor-suppressive or differentiation-associated functions, without requiring genetic mutation. MXD4 CE directly derepresses MYC — one of the most frequently activated oncogenes in breast cancer. DNAAF1 CE occurs on a background of aberrant gene activation, suggesting that the tumor transcriptional program both misexpresses and simultaneously truncates this gene. These findings illustrate the potential of IsoCAPE to detect functionally relevant isoform events from standard archived RNA-seq data, and motivate validation in larger cohorts and matched normal tissue.
 
 ---
 
