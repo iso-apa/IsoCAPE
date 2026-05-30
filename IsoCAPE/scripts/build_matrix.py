@@ -191,15 +191,16 @@ def collect_sites(parquet_path, batch_size=500_000):
 # Pass 2: cluster + UMI dedup → count matrix
 # ---------------------------------------------------------------------------
 
-def build_counts(gene_data, tolerance=10, min_reads=3):
+def build_counts(gene_data, tolerance=10, min_reads=3, min_reads_alu=5):
     """
     For each (gene, chrom, strand, site_type) group:
     1. Cluster positions within ±tolerance bp
     2. Filter clusters with < min_reads total reads
     3. Assign coord-based site_id:
-       CE    → GENE_CE_{rep_coord}
-       PA    → GENE_PA_{rep_coord}
-       known → GENE_known_{rep_coord}
+       CE     → GENE_CE_{rep_coord}
+       AluCE  → GENE_AluCE_{rep_coord}
+       PA     → GENE_PA_{rep_coord}
+       known  → GENE_known_{rep_coord}
     4. UMI-deduplicate per (cb, site_id)
     5. Count UMIs per (cb, site_id)
 
@@ -223,7 +224,8 @@ def build_counts(gene_data, tolerance=10, min_reads=3):
 
         for rep_coord, items in clusters.items():
 
-            if len(items) < min_reads:
+            threshold = min_reads_alu if site_type == 'AluCE' else min_reads
+            if len(items) < threshold:
                 n_filtered += 1
                 continue
 
@@ -233,6 +235,8 @@ def build_counts(gene_data, tolerance=10, min_reads=3):
             # Coord-based stable naming — site_type from key (never ambiguous)
             if site_type == 'CE':
                 site_id = f"{gene}_CE_{rep_coord}"
+            elif site_type == 'AluCE':
+                site_id = f"{gene}_AluCE_{rep_coord}"
             elif site_type == 'PA':
                 site_id = f"{gene}_PA_{rep_coord}"
             else:
@@ -368,6 +372,7 @@ def build_anndata(counts, site_meta, labels_path=None, sample=None, polyadb=None
     print(f"[Matrix] AnnData: {adata.n_obs:,} cells × {adata.n_vars:,} sites")
     print(f"  known sites:      {(var['site_type']=='known').sum():,}")
     print(f"  CE sites:         {(var['site_type']=='CE').sum():,}")
+    print(f"  AluCE sites:      {(var['site_type']=='AluCE').sum():,}")
     if polyadb:
         print(f"  PA_validated:     {(var['site_type']=='PA_validated').sum():,}")
         print(f"  PA_novel:         {(var['site_type']=='PA_novel').sum():,}")
@@ -407,6 +412,8 @@ def parse_args():
                         help="Minimum total reads per site cluster across all cells (default: 3). "
                              "Removes absolute singleton sites. "
                              "For cell-level filtering use sc.pp.filter_genes(adata, min_cells=3) downstream.")
+    parser.add_argument("--min-reads-alu", type=int, default=5,
+                        help="Min reads per AluCE cluster (default: 5, stricter than CE).")
     parser.add_argument("--batch-size", type=int, default=500_000,
                         help="Reads per batch for Pass 1 (default: 500,000)")
     return parser.parse_args()
@@ -423,6 +430,7 @@ def main():
         gene_data,
         tolerance=args.tolerance,
         min_reads=args.min_reads,
+        min_reads_alu=args.min_reads_alu,
     )
 
     # Load PolyA_DB (optional)

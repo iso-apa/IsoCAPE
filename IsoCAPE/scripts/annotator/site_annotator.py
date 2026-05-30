@@ -6,24 +6,21 @@ Detects cryptic and alternative polyadenylation sites
 that are NOT recorded in GTF annotation.
 
 Decision logic per read:
-  1. UNK_GENE                    → skip (no gene context)
-  2. known 3'end ±known_window   → known (default 50bp, matches read scatter)
-  3. no PAS signal               → skip (noise)
-  4. intronic + PAS              → CE (not affected by known_window)
-  5. genic + PAS + dist > known_window from any known → PA (truly unannotated)
+  1. UNK_GENE (no PAS, not Alu boundary) → skip
+  1b. UNK_GENE + Alu boundary            → AluCE (deep intronic reads)
+  2. known 3'end ±known_window           → known (default 50bp)
+  3. no PAS signal + not Alu boundary    → skip (noise)
+  3b. no PAS signal + Alu boundary       → AluCE
+  4. intronic + PAS                      → CE
+  5. genic + PAS + dist > known_window   → PA
 
---known-window 50bp : read scatter window for known 3'end matching.
-  Covers ~20bp biological cleavage variation + ~5bp alignment noise.
-  CE detection is unaffected — intronic reads are CE regardless of
-  distance to known sites.
-  PA = genuinely unannotated, > known_window from any GTF 3'end.
-
-
-
-Validation (separate workflow):
-    IsoCAPE known site:  GENE_known_{coord}
-    IsoDecipher G-group: GENE_G0, rep_coord ≈ coord
-    → coord matching → Pearson correlation (target r > 0.99)
+Alu CE detection:
+  Uses RepeatMasker BED file (--alu-bed) when provided.
+  Falls back to soft-masking check (hg38 lowercase) otherwise.
+  Genuine Alu CE: ref_end is just past Alu element boundary
+    → upstream overlaps with Alu element
+    → ref_end itself is NOT inside any Alu element
+  Internal priming: ref_end is inside Alu body → rejected
 
 Usage:
 python isocape/annotator/site_annotator.py \
@@ -32,7 +29,7 @@ python isocape/annotator/site_annotator.py \
     --db      path/to/Homo_sapiens.GRCh38.115.gtf.db \
     --ref     path/to/ref.fa \
     --out     path/to/cryptic_sites.parquet \
-
+    --alu-bed path/to/alu_hg38.bed \
     [--batch-size 500000]
 """
 
@@ -57,12 +54,9 @@ PAS_SIGNALS = {
     "CATAAA", "GATAAA", "AATATA", "AATACA",
     "AATAGA", "AATGAA", "ACTAAA", "AACAAA",
 }
-PAS_WINDOW    = 60  # bp upstream of ref_end to scan for PAS signal
-                    # covers ~20bp cleavage variation + ~5bp alignment noise
-                    # + 30bp typical PAS-to-cleavage distance
-PAS_MIN_DIST  = 10  # minimum distance from ref_end to PAS signal
-                    # PAS normally 10-30bp upstream of cleavage site
-                    # signals closer than 10bp are likely false positives
+PAS_WINDOW    = 60
+PAS_MIN_DIST  = 10
+ALU_WINDOW    = 50  # bp upstream to scan for Alu overlap
 
 
 # ---------------------------------------------------------------------------
@@ -70,17 +64,11 @@ PAS_MIN_DIST  = 10  # minimum distance from ref_end to PAS signal
 # ---------------------------------------------------------------------------
 
 class SiteRegistry:
-    """
-    Assigns stable unique names across batches.
-    Intronic sites  → GENE_CE1, GENE_CE2 ...
-    Genic sites     → GENE_PA1, GENE_PA2 ...
-    Known 3' ends   → GENE_known_1, GENE_known_2 ... (--include-known)
-    """
-
     def __init__(self):
         self._ce_counts    = defaultdict(int)
         self._pa_counts    = defaultdict(int)
         self._known_counts = defaultdict(int)
+        self._alu_counts   = defaultdict(int)
         self._pos_to_name  = {}
 
     def get_ce(self, gene, chrom, pos, strand):
@@ -104,6 +92,13 @@ class SiteRegistry:
             self._pos_to_name[key] = f"{gene}_known_{self._known_counts[gene]}"
         return self._pos_to_name[key]
 
+    def get_alu(self, gene, chrom, pos, strand):
+        key = (gene, chrom, pos, strand, 'alu')
+        if key not in self._pos_to_name:
+            self._alu_counts[gene] += 1
+            self._pos_to_name[key] = f"{gene}_AluCE_{pos}"
+        return self._pos_to_name[key]
+
     @property
     def n_unique(self):
         return len(self._pos_to_name)
@@ -120,6 +115,10 @@ class SiteRegistry:
     def n_known(self):
         return sum(self._known_counts.values())
 
+    @property
+    def n_alu(self):
+        return sum(self._alu_counts.values())
+
 
 # ---------------------------------------------------------------------------
 # PAS signal check
@@ -127,16 +126,7 @@ class SiteRegistry:
 
 def check_pas_signal(fasta, chrom, ref_end, strand, window=PAS_WINDOW,
                      min_dist=PAS_MIN_DIST):
-    """
-    Scan upstream of ref_end for PAS signal.
-
-    Parameters
-    ----------
-    window   : bp upstream to scan (default 60bp)
-    min_dist : minimum distance from ref_end to PAS (default 10bp)
-               PAS normally 10-30bp upstream of cleavage site.
-               Signals closer than min_dist are likely false positives.
-    """
+    """Scan upstream of ref_end for PAS signal."""
     try:
         chrom_len = fasta.get_reference_length(chrom)
         if strand == '+':
@@ -149,11 +139,7 @@ def check_pas_signal(fasta, chrom, ref_end, strand, window=PAS_WINDOW,
             upstream    = fasta.fetch(chrom, fetch_start, fetch_end).upper()
             upstream    = upstream[::-1]
 
-        # upstream[-1] is closest to ref_end, upstream[0] is furthest
-        # min_dist: PAS must be at least min_dist bp from ref_end
-        # i.e. PAS must be in upstream[0 : len(upstream) - min_dist]
         search_region = upstream[:len(upstream) - min_dist]
-
         for signal in PAS_SIGNALS:
             if signal in search_region:
                 return signal
@@ -163,19 +149,130 @@ def check_pas_signal(fasta, chrom, ref_end, strand, window=PAS_WINDOW,
 
 
 # ---------------------------------------------------------------------------
+# Alu element boundary check
+# ---------------------------------------------------------------------------
+
+def load_alu_trees(alu_bed_path):
+    """
+    Load RepeatMasker Alu BED file into per-chromosome interval trees.
+    BED format: chrom start end name score strand
+    Generated by: gunzip -c rmsk.txt.gz | awk '$13=="Alu"' | ...
+    """
+    from intervaltree import IntervalTree
+    import pandas as pd
+
+    print(f"[IsoCAPE] Loading Alu BED: {alu_bed_path}")
+    df = pd.read_csv(alu_bed_path, sep='\t', header=None,
+                     names=['chrom','start','end','name','score','strand'])
+    trees = defaultdict(IntervalTree)
+    for row in df.itertuples(index=False):
+        trees[row.chrom][row.start:row.end] = row.name
+    print(f"[IsoCAPE] Loaded {len(df):,} Alu elements across {len(trees)} chroms")
+    return trees
+
+
+def is_alu_boundary_rmsk(alu_trees, chrom, ref_end, strand,
+                           window=ALU_WINDOW):
+    """
+    Check Alu CE boundary using RepeatMasker interval tree.
+
+    Genuine Alu CE:
+      - upstream window overlaps with an Alu element
+      - ref_end itself is NOT inside any Alu element
+      → reads terminate just past the Alu 3' end
+
+    Internal priming:
+      - ref_end is inside an Alu element
+      → reads terminate within the Alu body (A-rich linker)
+
+    Returns
+    -------
+    (bool, str) : (is_alu_boundary, alu_name or '')
+    """
+    chrom_key = chrom if chrom.startswith('chr') else f'chr{chrom}'
+
+    # ref_end inside Alu → internal priming, not CE
+    in_alu_hits = alu_trees[chrom_key][ref_end - 1:ref_end + 1]
+    if in_alu_hits:
+        return False, ''
+
+    # upstream overlaps with Alu → at boundary
+    if strand == '+':
+        up_hits = alu_trees[chrom_key][max(0, ref_end - window):ref_end]
+    else:
+        up_hits = alu_trees[chrom_key][ref_end:ref_end + window]
+
+    if up_hits:
+        alu_name = next(iter(up_hits)).data
+        return True, alu_name
+    return False, ''
+
+
+def is_alu_boundary_softmask(fasta, chrom, ref_end, strand,
+                               window=ALU_WINDOW, min_alu_pct=0.7):
+    """
+    Fallback: check Alu CE boundary using hg38 soft-masking (lowercase).
+    Less precise than RepeatMasker but requires no extra file.
+
+    Returns
+    -------
+    (bool, float) : (is_alu_boundary, alu_pct_upstream)
+    """
+    try:
+        chrom_fa  = chrom if chrom.startswith('chr') else f'chr{chrom}'
+        chrom_len = fasta.get_reference_length(chrom_fa)
+        if strand == '+':
+            up_seq = fasta.fetch(chrom_fa, max(0, ref_end - window), ref_end)
+            ds_seq = fasta.fetch(chrom_fa, ref_end, min(ref_end + 5, chrom_len))
+        else:
+            up_seq = fasta.fetch(chrom_fa, ref_end, min(ref_end + window, chrom_len))
+            up_seq = up_seq[::-1]
+            ds_seq = fasta.fetch(chrom_fa, max(0, ref_end - 5), ref_end)
+            ds_seq = ds_seq[::-1]
+
+        if not up_seq:
+            return False, 0.0
+
+        n_lower  = sum(1 for c in up_seq if c.islower())
+        alu_pct  = n_lower / len(up_seq)
+        at_boundary = (alu_pct >= min_alu_pct and
+                       len(ds_seq) > 0 and
+                       ds_seq == ds_seq.upper() and
+                       ds_seq.isalpha())
+        return at_boundary, alu_pct
+    except Exception:
+        return False, 0.0
+
+
+def check_alu_boundary(fasta, chrom, ref_end, strand, alu_trees=None):
+    """
+    Unified Alu boundary check.
+    Uses RepeatMasker trees if available, falls back to soft-masking.
+
+    Returns
+    -------
+    (bool, str) : (is_alu_boundary, alu_label)
+                  alu_label = Alu family name (rmsk) or 'Alu:{pct}' (softmask)
+    """
+    if alu_trees is not None:
+        is_alu, alu_name = is_alu_boundary_rmsk(alu_trees, chrom, ref_end, strand)
+        return is_alu, alu_name
+    else:
+        is_alu, alu_pct = is_alu_boundary_softmask(fasta, chrom, ref_end, strand)
+        return is_alu, f'Alu:{alu_pct:.2f}'
+
+
+# ---------------------------------------------------------------------------
 # Annotate one batch
 # ---------------------------------------------------------------------------
 
-def annotate_batch(df, parser, fasta, registry, known_window=50):
+def annotate_batch(df, parser, fasta, registry, known_window=50,
+                   alu_trees=None):
     """
-    Returns DataFrame: known + CE + PA.
+    Returns DataFrame: known + CE + AluCE + PA.
 
-    known_window: distance from GTF 3'end for known site matching (default 50bp)
-                  covers 90bp read positional scatter
-    CE is window-independent — intronic reads are CE regardless of
-    distance to known sites.
-
-    PA = genic + PAS + distance > known_window from any known 3'end
+    Alu CE detection uses RepeatMasker trees (preferred) or soft-masking.
+    UNK_GENE reads are allowed through only if at confirmed Alu boundary.
     """
     import pandas as pd
 
@@ -187,11 +284,45 @@ def annotate_batch(df, parser, fasta, registry, known_window=50):
         strand  = row.strand
         gn      = row.gn
 
-        # 1. Skip UNK_GENE
+        # ── 1. UNK_GENE ───────────────────────────────────────────────────
+        # Cell Ranger does not assign GN to reads far from exon boundaries.
+        # Alu CE reads in deep introns (e.g. MGA intron 17) are often UNK_GENE.
+        # Allow through ONLY if at confirmed Alu boundary in a protein_coding intron.
         if gn == 'UNK_GENE':
-            continue
+            # Try read strand first, then opposite strand.
+            # Antisense Alu: +strand genes have Alu inserted antisense.
+            # oligo-dT captures the Alu A-rich tail on the antisense strand
+            # → reads map to - strand (flag=16) even though gene is + strand.
+            opposite_strand = '+' if strand == '-' else '-'
+            for query_strand in [strand, opposite_strand]:
+                intron_hits_unk = parser.query_intron(chrom, ref_end, query_strand)
+                if not intron_hits_unk:
+                    continue
+                exon_hits_unk = parser.query_exon(chrom, ref_end, query_strand)
+                if exon_hits_unk:
+                    continue
+                is_alu, alu_label = check_alu_boundary(
+                    fasta, chrom, ref_end, query_strand, alu_trees)
+                if is_alu:
+                    intron_gene_unk = intron_hits_unk[0][0]
+                    site_id = registry.get_alu(
+                        intron_gene_unk, chrom, ref_end, strand)
+                    rows.append({
+                        'cb':        row.cb,
+                        'ub':        row.ub,
+                        'gn':        gn,
+                        'chrom':     chrom,
+                        'ref_end':   ref_end,
+                        'strand':    strand,
+                        'site_id':   site_id,
+                        'site_type': 'AluCE',
+                        'pas_signal': alu_label,
+                        'gene':      intron_gene_unk,
+                    })
+                    break  # found on this strand, stop
+            continue  # UNK_GENE: skip if not Alu boundary
 
-        # 2. Known 3'end check — use known_window (read scatter)
+        # ── 2. Known 3'end ────────────────────────────────────────────────
         known_hits = parser.query_3p_end(chrom, ref_end, strand, window=known_window)
         if known_hits:
             gene    = known_hits[0][0]
@@ -210,23 +341,44 @@ def annotate_batch(df, parser, fasta, registry, known_window=50):
             })
             continue
 
-        # 3. PAS signal required for CE and PA
+        # ── 3. PAS signal check ───────────────────────────────────────────
         pas = check_pas_signal(fasta, chrom, ref_end, strand)
-        if not pas:
-            continue
 
-        # 4. Classify: intronic (CE) or genic (PA)
-        # CE requires:
-        #   a) in protein_coding intron (query_intron hit)
-        #   b) NOT in any exon (query_exon check)
-        #   c) GN tag matches intron gene (consistency check)
-        #      → prevents neighboring gene reads being mis-assigned
+        # ── 3b. No PAS → check for Alu CE ────────────────────────────────
+        # Alu CE lacks canonical PAS but terminates at Alu/unique boundary.
+        # Requires: protein_coding intron + GN tag match + Alu boundary.
+        if not pas:
+            intron_hits_alu = parser.query_intron(chrom, ref_end, strand)
+            if intron_hits_alu:
+                exon_hits_alu = parser.query_exon(chrom, ref_end, strand)
+                if not exon_hits_alu:
+                    intron_gene_alu = intron_hits_alu[0][0]
+                    if gn == intron_gene_alu:
+                        is_alu, alu_label = check_alu_boundary(
+                            fasta, chrom, ref_end, strand, alu_trees)
+                        if is_alu:
+                            site_id = registry.get_alu(
+                                intron_gene_alu, chrom, ref_end, strand)
+                            rows.append({
+                                'cb':        row.cb,
+                                'ub':        row.ub,
+                                'gn':        gn,
+                                'chrom':     chrom,
+                                'ref_end':   ref_end,
+                                'strand':    strand,
+                                'site_id':   site_id,
+                                'site_type': 'AluCE',
+                                'pas_signal': alu_label,
+                                'gene':      intron_gene_alu,
+                            })
+            continue  # no PAS and not Alu → skip
+
+        # ── 4. Classify: CE or PA ─────────────────────────────────────────
         intron_hits = parser.query_intron(chrom, ref_end, strand)
         if intron_hits:
             exon_hits = parser.query_exon(chrom, ref_end, strand)
             if not exon_hits:
                 intron_gene = intron_hits[0][0]
-                # GN tag must match intron gene — else skip (neighboring gene noise)
                 if gn == intron_gene:
                     site_id   = registry.get_ce(intron_gene, chrom, ref_end, strand)
                     site_type = 'CE'
@@ -234,7 +386,6 @@ def annotate_batch(df, parser, fasta, registry, known_window=50):
                 else:
                     continue  # GN tag mismatch → skip
             else:
-                # In exon of some transcript → PA
                 gene      = gn
                 site_id   = registry.get_pa(gene, chrom, ref_end, strand)
                 site_type = 'PA'
@@ -292,16 +443,18 @@ def parse_args():
     parser.add_argument("--db",         default=None)
     parser.add_argument("--ref",        required=True)
     parser.add_argument("--out",        required=True)
+    parser.add_argument("--alu-bed",    default=None,
+                        help="RepeatMasker Alu BED file for Alu CE detection "
+                             "(chrom start end name score strand). "
+                             "Generate with: gunzip -c rmsk.txt.gz | "
+                             "awk '$13==\"Alu\"' | awk '{print $6\"\\t\"$7\"\\t\"$8\"\\t\"$11\"\\t\"$2\"\\t\"$10}' "
+                             "| sort -k1,1 -k2,2n > alu_hg38.bed. "
+                             "If not provided, falls back to hg38 soft-masking check.")
     parser.add_argument("--known-window", type=int, default=50,
-                        help="Read scatter window for known 3' end matching (default: 50bp). "
-                             "Reads within this distance of a GTF annotated 3'end are labeled "
-                             "'known'. Should match read length (~90bp for 10x v3). "
-                             "CE detection is unaffected by this parameter.")
+                        help="Read scatter window for known 3' end matching (default: 50bp).")
     parser.add_argument("--batch-size", type=int, default=500_000)
     parser.add_argument("--include-no-ref", action="store_true",
-                        help="Include NO_REF reads (chrom not in reference FASTA). "
-                             "Default: only VALID_PAS reads. "
-                             "Use during testing with partial reference.")
+                        help="Include NO_REF reads. Default: VALID_PAS only.")
     return parser.parse_args()
 
 
@@ -317,13 +470,16 @@ def main():
     pf       = pq.ParquetFile(args.parquet)
     writer   = None
 
-    # Determine which priming labels to include
-    if args.include_no_ref:
-        valid_labels = {'VALID_PAS', 'NO_REF'}
-        print(f"[IsoCAPE] Including NO_REF reads (testing mode with partial reference)")
+    # Load Alu trees if provided
+    alu_trees = None
+    if args.alu_bed:
+        alu_trees = load_alu_trees(args.alu_bed)
+        print(f"[IsoCAPE] Alu CE detection: RepeatMasker BED ✅")
     else:
-        valid_labels = {'VALID_PAS'}
-        print(f"[IsoCAPE] VALID_PAS only (use --include-no-ref for partial reference)")
+        print(f"[IsoCAPE] Alu CE detection: soft-masking fallback "
+              f"(provide --alu-bed for higher precision)")
+
+    valid_labels = {'VALID_PAS', 'NO_REF'} if args.include_no_ref else {'VALID_PAS'}
 
     total_reads = 0
     total_valid = 0
@@ -331,8 +487,7 @@ def main():
     batch_num   = 0
 
     print(f"[IsoCAPE] Streaming (batch={args.batch_size:,}, known_window=±{args.known_window}bp)")
-    print(f"[IsoCAPE] Output: known + CE + PA")
-    print(f"[IsoCAPE] Skipping: UNK_GENE | no PAS signal (for CE/PA)")
+    print(f"[IsoCAPE] Output: known + CE + AluCE + PA")
 
     for batch in pf.iter_batches(batch_size=args.batch_size):
         import pandas as pd
@@ -350,7 +505,8 @@ def main():
 
         df_out = annotate_batch(
             df, gtf_parser, fasta, registry,
-            known_window=args.known_window
+            known_window=args.known_window,
+            alu_trees=alu_trees
         )
 
         if df_out is None or df_out.empty:
@@ -368,7 +524,7 @@ def main():
               f"valid={total_valid:,} | "
               f"sites={total_sites:,} | "
               f"known={registry.n_known:,} "
-              f"CE={registry.n_ce:,} PA={registry.n_pa:,} | "
+              f"CE={registry.n_ce:,} AluCE={registry.n_alu:,} PA={registry.n_pa:,} | "
               f"unique={registry.n_unique:,}")
 
     if writer:
@@ -382,6 +538,7 @@ def main():
     print(f"  IsoCAPE site reads: {total_sites:,}")
     print(f"  Unique known sites: {registry.n_known:,}")
     print(f"  Unique CE sites:    {registry.n_ce:,}")
+    print(f"  Unique AluCE sites: {registry.n_alu:,}")
     print(f"  Unique PA sites:    {registry.n_pa:,}")
     print(f"  Total unique sites: {registry.n_unique:,}")
     print(f"  IsoCAPE rate:       {total_sites/total_valid:.3%} of VALID_PAS")
